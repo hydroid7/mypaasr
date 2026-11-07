@@ -132,7 +132,7 @@ enum KeyCmd {
 
 #[derive(Subcommand)]
 enum ServerCmd {
-    /// Create ~/_mypaas, the Traefik files and the systemd unit. Safe to run again.
+    /// Create ~/_mypaas, the Traefik files and the systemd units. Safe to run again.
     Init {
         #[arg(long)]
         domain: Option<String>,
