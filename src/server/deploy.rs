@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use super::Progress;
+use super::{Progress, owner};
 use super::docker::{
     container_ip, docker, docker_quiet, docker_stream, ensure_network, image_exists, image_id, is_running,
     list_containers,
@@ -88,9 +88,6 @@ pub async fn deploy_dir(
     let cfg = ServerConfig::load(paths)?;
     let limits = cfg.limits()?;
     let prepared = prepare(paths, &cfg, &limits, &spec, caller)?;
-    if info.runs_as_root {
-        say(progress, "warning: the image runs as root; add a USER line to the Dockerfile");
-    }
 
     let deploy_id = new_deploy_id();
     let image = format!("{}:{deploy_id}", image_repo(&spec.service));
@@ -110,7 +107,12 @@ pub async fn deploy_dir(
     ]);
     docker_stream(&args, progress, Duration::from_millis(limits.build_timeout_ms)).await?;
 
-    if let Err(e) = replace_containers(paths, &spec, &prepared, &image, &deploy_id, progress).await {
+    let result = async {
+        prepare_ownership(paths, &cfg, &spec, &image, progress).await?;
+        replace_containers(paths, &spec, &prepared, &image, &deploy_id, progress).await
+    }
+    .await;
+    if let Err(e) = result {
         docker_quiet(&["rmi", &image]).await;
         return Err(e);
     }
@@ -143,6 +145,7 @@ pub async fn rollback(paths: &Paths, service: &str, caller: &Caller, progress: &
     let limits = cfg.limits()?;
     let prepared = prepare(paths, &cfg, &limits, &previous.spec, caller)?;
     say(progress, format!("rolling back {service} to {}", previous.deploy_id));
+    prepare_ownership(paths, &cfg, &previous.spec, &image, progress).await?;
     replace_containers(paths, &previous.spec, &prepared, &image, &previous.deploy_id, progress).await?;
 
     docker(&["tag", &image, &format!("{}:current", image_repo(service))]).await?;
@@ -152,6 +155,15 @@ pub async fn rollback(paths: &Paths, service: &str, caller: &Caller, progress: &
     prune(service).await;
     say(progress, format!("rolled back {service}; no further rollback is possible"));
     Ok(())
+}
+
+/// Warns about root images and hands empty named volumes to the image's user.
+async fn prepare_ownership(paths: &Paths, cfg: &ServerConfig, spec: &ServiceSpec, image: &str, progress: &Progress) -> Result<()> {
+    let user = owner::image_user(image).await?;
+    if user == owner::ImageUser::Root {
+        say(progress, "warning: the image runs as root; add a USER line to the Dockerfile");
+    }
+    owner::prepare_volumes(paths, cfg, spec, &user, progress)
 }
 
 pub fn read_record(path: &Path) -> Result<Option<DeployRecord>> {

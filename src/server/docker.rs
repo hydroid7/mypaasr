@@ -25,6 +25,15 @@ pub async fn docker(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Like [`docker`], but returns stdout as raw bytes.
+pub async fn docker_bytes(args: &[&str]) -> Result<Vec<u8>> {
+    let out = Command::new("docker").args(args).stdin(Stdio::null()).output().await.context("cannot run docker")?;
+    if !out.status.success() {
+        bail!("docker {} failed: {}", args.first().unwrap_or(&""), String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(out.stdout)
+}
+
 /// Like [`docker`], but a failure is only logged.
 pub async fn docker_quiet(args: &[&str]) -> bool {
     match docker(args).await {

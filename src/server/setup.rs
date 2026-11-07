@@ -6,12 +6,24 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::auth::{self, AuthorizedKey, Scope};
+use super::sockproxy;
 use crate::config::{Paths, ROUTER_CONTAINER, ServerConfig, TRAEFIK_VERSION, write_atomic};
 
 pub const SYSTEMD_UNIT: &str = "/etc/systemd/system/mypaasd.service";
+pub const PROXY_UNIT: &str = "/etc/systemd/system/mypaas-socket-proxy.service";
+/// Where Traefik sees the proxy's socket directory.
+const PROXY_MOUNT: &str = "/mypaas-run";
 
 pub fn init(paths: &Paths, domain: &str, email: &str, key: Option<&str>) -> Result<()> {
-    for dir in [paths.root.clone(), paths.secrets_dir(), paths.services_dir(), paths.volumes_dir(), paths.tmp()] {
+    for dir in [
+        paths.root.clone(),
+        paths.secrets_dir(),
+        paths.services_dir(),
+        paths.volumes_dir(),
+        paths.tmp(),
+        sockproxy::socket_dir(paths),
+        paths.root.join("docker-config"),
+    ] {
         std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
     }
     set_mode(&paths.root, 0o700)?;
@@ -52,11 +64,12 @@ pub fn init(paths: &Paths, domain: &str, email: &str, key: Option<&str>) -> Resu
         eprintln!("warning: no key in authorized_keys yet; add one with `mypaas server key add FILE --name me --scope admin`");
     }
 
-    if Path::new("/etc/systemd/system").is_dir() && unsafe { libc::geteuid() } == 0 {
-        write_systemd_unit(paths)?;
-        println!("wrote {SYSTEMD_UNIT}; start everything with `mypaas server restart all`");
+    // /run/systemd/system exists only while systemd is the running init.
+    if Path::new("/run/systemd/system").is_dir() && unsafe { libc::geteuid() } == 0 {
+        write_systemd_units(paths, &cfg)?;
+        println!("wrote the systemd units; start everything with `mypaas server restart all`");
     } else {
-        println!("not root or no systemd: skipped the systemd unit");
+        println!("not root or systemd is not running: skipped the systemd units");
     }
     println!("initialized {}", paths.root.display());
     Ok(())
@@ -85,6 +98,11 @@ pub fn write_traefik_files(paths: &Paths, cfg: &ServerConfig) -> Result<()> {
 
 pub fn traefik_toml(cfg: &ServerConfig) -> String {
     let email = if cfg.email.is_empty() { String::new() } else { format!("email = \"{}\"\n", cfg.email) };
+    let endpoint = if cfg.router.socket_proxy {
+        format!("# Read-only access through `mypaas server socket-proxy`.\nendpoint = \"unix://{PROXY_MOUNT}/docker.sock\"\n")
+    } else {
+        String::new()
+    };
     format!(
         r#"# Written by mypaas server init; changes are overwritten.
 
@@ -102,7 +120,7 @@ address = ":443"
 readTimeout = "600s"
 
 [providers.docker]
-exposedByDefault = false
+{endpoint}exposedByDefault = false
 watch = true
 
 [providers.file]
@@ -178,6 +196,27 @@ cipherSuites = [
     )
 }
 
+/// Sandboxing shared by both units. The daemon is root-equivalent through the
+/// Docker socket anyway; these limit what a bug in it can touch directly.
+const HARDENING: &str = "NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service";
+
 pub fn systemd_unit(paths: &Paths, exe: &Path) -> String {
     format!(
         r#"[Unit]
@@ -188,12 +227,15 @@ Requires=docker.service
 [Service]
 ExecStart={exe} server daemon
 Environment=MYPAAS_HOME={root}
+Environment=DOCKER_CONFIG={root}/docker-config
 Restart=always
 RestartSec=2
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=strict
-ReadWritePaths={root} /run/docker.sock -/root/.docker
+UMask=0022
+{HARDENING}
+ReadWritePaths={root}
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Port 88, and reading and chowning volume directories owned by service users.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
 
 [Install]
 WantedBy=multi-user.target
@@ -203,11 +245,46 @@ WantedBy=multi-user.target
     )
 }
 
-fn write_systemd_unit(paths: &Paths) -> Result<()> {
+pub fn proxy_unit(paths: &Paths, exe: &Path) -> String {
+    format!(
+        r#"[Unit]
+Description=mypaas read-only Docker socket proxy for Traefik
+After=docker.service
+Requires=docker.service
+
+[Service]
+ExecStart={exe} server socket-proxy
+Environment=MYPAAS_HOME={root}
+Restart=always
+RestartSec=2
+UMask=0077
+{HARDENING}
+ReadWritePaths={run}
+# Unix sockets only: no network at all, and no capabilities.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        exe = exe.display(),
+        root = paths.root.display(),
+        run = sockproxy::socket_dir(paths).display()
+    )
+}
+
+fn write_systemd_units(paths: &Paths, cfg: &ServerConfig) -> Result<()> {
     let exe = std::env::current_exe()?;
     write_atomic(Path::new(SYSTEMD_UNIT), systemd_unit(paths, &exe).as_bytes(), 0o644)?;
+    write_atomic(Path::new(PROXY_UNIT), proxy_unit(paths, &exe).as_bytes(), 0o644)?;
     run("systemctl", &["daemon-reload"])?;
     run("systemctl", &["enable", "mypaasd"])?;
+    if cfg.router.socket_proxy {
+        run("systemctl", &["enable", "mypaas-socket-proxy"])?;
+    } else {
+        let _ = Command::new("systemctl").args(["disable", "--now", "mypaas-socket-proxy"]).status();
+    }
     Ok(())
 }
 
@@ -240,11 +317,22 @@ fn restart_daemon() -> Result<()> {
 fn restart_router(paths: &Paths) -> Result<()> {
     let cfg = ServerConfig::load(paths)?;
     write_traefik_files(paths, &cfg)?;
+    if cfg.router.socket_proxy {
+        run("systemctl", &["restart", "mypaas-socket-proxy"])?;
+        println!("restarted mypaas-socket-proxy");
+    }
     let image = format!("traefik:v{TRAEFIK_VERSION}");
     run("docker", &["pull", &image])?;
     let _ = Command::new("docker").args(["rm", "-f", ROUTER_CONTAINER]).output();
     let mount = |src: &Path, dst: &str, ro: bool| {
         format!("type=bind,source={},target={dst}{}", src.display(), if ro { ",readonly" } else { "" })
+    };
+    // The proxy's directory rather than its socket file, so a restarted proxy is
+    // picked up. Without the proxy Traefik gets the raw socket.
+    let docker_mount = if cfg.router.socket_proxy {
+        mount(&sockproxy::socket_dir(paths), PROXY_MOUNT, true)
+    } else {
+        "type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock,readonly".to_string()
     };
     // Host networking lets Traefik reach the daemon on loopback and every
     // service's bridge network; it binds ports 80 and 443 itself.
@@ -270,7 +358,7 @@ fn restart_router(paths: &Paths) -> Result<()> {
             "--mount",
             &mount(&paths.acme_json(), "/acme.json", false),
             "--mount",
-            "type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock,readonly",
+            &docker_mount,
             &image,
             "--configFile=/traefik.toml",
         ],
@@ -384,6 +472,11 @@ mod tests {
             Some("Host(`paas.example.com`) && Path(`/v1/deploy`)")
         );
         assert_eq!(s["http"]["services"]["mypaas-daemon"]["loadBalancer"]["servers"][0]["url"].as_str(), Some("http://127.0.0.1:88"));
+        assert_eq!(t["providers"]["docker"]["endpoint"].as_str(), Some("unix:///mypaas-run/docker.sock"));
+        let mut raw = cfg.clone();
+        raw.router.socket_proxy = false;
+        let t: toml::Value = toml::from_str(&traefik_toml(&raw)).unwrap();
+        assert!(t["providers"]["docker"].get("endpoint").is_none());
     }
 
     #[test]

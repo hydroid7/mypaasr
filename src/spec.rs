@@ -132,8 +132,6 @@ impl ServiceSpec {
 pub struct DockerfileInfo {
     /// Some `FROM` line uses `:latest` or no tag, so the build should `--pull`.
     pub pull: bool,
-    /// The final stage runs as root (no `USER`, or `USER root`/`0`).
-    pub runs_as_root: bool,
 }
 
 pub fn parse_dockerfile(text: &str) -> Result<(ServiceSpec, DockerfileInfo)> {
@@ -274,13 +272,11 @@ pub fn parse_spec(text: &str) -> Result<ServiceSpec> {
 }
 
 fn dockerfile_info(text: &str) -> DockerfileInfo {
-    let mut info = DockerfileInfo { pull: false, runs_as_root: true };
+    let mut info = DockerfileInfo { pull: false };
     for line in text.lines() {
         let mut words = line.split_whitespace();
         let Some(instr) = words.next() else { continue };
         if instr.eq_ignore_ascii_case("FROM") {
-            // A new stage starts as root again.
-            info.runs_as_root = true;
             let image = words.find(|w| !w.starts_with("--")).unwrap_or("");
             let name = image.rsplit('/').next().unwrap_or(image);
             if !image.contains('@') && (!name.contains(':') || name.ends_with(":latest")) && image != "scratch" {
@@ -290,10 +286,6 @@ fn dockerfile_info(text: &str) -> DockerfileInfo {
                     info.pull = true;
                 }
             }
-        } else if instr.eq_ignore_ascii_case("USER") {
-            let user = words.next().unwrap_or("");
-            let user = user.split(':').next().unwrap_or("");
-            info.runs_as_root = user == "root" || user == "0";
         }
     }
     info
@@ -665,15 +657,12 @@ mod tests {
     }
 
     #[test]
-    fn dockerfile_pull_and_user() {
-        let info = dockerfile_info("FROM python:3.12\nUSER app\n");
-        assert!(!info.pull && !info.runs_as_root);
-        let info = dockerfile_info("FROM python\n");
-        assert!(info.pull && info.runs_as_root);
-        let info = dockerfile_info("FROM rust:1 AS build\nFROM build\nUSER 0\n");
-        assert!(!info.pull && info.runs_as_root);
-        let info = dockerfile_info("FROM --platform=linux/amd64 nginx:latest\nUSER www:www\n");
-        assert!(info.pull && !info.runs_as_root);
+    fn dockerfile_pull() {
+        assert!(!dockerfile_info("FROM python:3.12\nUSER app\n").pull);
+        assert!(dockerfile_info("FROM python\n").pull);
+        assert!(!dockerfile_info("FROM rust:1 AS build\nFROM build\n").pull);
+        assert!(dockerfile_info("FROM --platform=linux/amd64 nginx:latest\n").pull);
+        assert!(!dockerfile_info("FROM scratch\n").pull);
     }
 
     #[test]

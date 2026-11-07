@@ -78,6 +78,7 @@ pub struct ServerConfig {
     pub maximums: Maximums,
     pub networks: BTreeMap<String, SharedNetwork>,
     pub volumes: VolumeConfig,
+    pub router: RouterConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,11 +115,33 @@ pub struct SharedNetwork {
     pub members: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VolumeConfig {
     /// Absolute host paths that admin deploys may mount.
     pub allow: Vec<String>,
+    /// Give empty named volumes to the image's non-root user.
+    pub chown: bool,
+}
+
+impl Default for VolumeConfig {
+    fn default() -> Self {
+        VolumeConfig { allow: Vec::new(), chown: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RouterConfig {
+    /// Traefik reaches Docker through mypaas' read-only socket proxy instead of
+    /// the raw socket, so the internet-facing process is not root-equivalent.
+    pub socket_proxy: bool,
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        RouterConfig { socket_proxy: true }
+    }
 }
 
 impl Default for ServerConfig {
@@ -132,6 +155,7 @@ impl Default for ServerConfig {
             maximums: Maximums::default(),
             networks: BTreeMap::new(),
             volumes: VolumeConfig::default(),
+            router: RouterConfig::default(),
         }
     }
 }

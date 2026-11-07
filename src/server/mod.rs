@@ -5,7 +5,9 @@ pub mod daemon;
 pub mod deploy;
 pub mod docker;
 pub mod guard;
+pub mod owner;
 pub mod setup;
+pub mod sockproxy;
 
 use std::fs::File;
 use std::os::fd::AsRawFd;

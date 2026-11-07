@@ -150,6 +150,9 @@ enum ServerCmd {
     /// Run the HTTP daemon (started by systemd).
     #[command(hide = true)]
     Daemon,
+    /// Run the read-only Docker socket proxy for Traefik (started by systemd).
+    #[command(hide = true)]
+    SocketProxy,
     Version,
 }
 
@@ -174,6 +177,14 @@ enum ServerKeyCmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if !matches!(cli.command, Command::Server(_)) {
+        // `mypaas ls | head` should end quietly. Rust ignores SIGPIPE so writes
+        // return errors instead; println! turns those into a panic. Network
+        // writes use MSG_NOSIGNAL and are unaffected. The server keeps ignoring
+        // it so a closed pipe can never kill the daemon.
+        // SAFETY: called before any thread is started.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
     let out = Output {
         json: cli.json,
         quiet: cli.quiet,
@@ -285,18 +296,32 @@ async fn run_server(cmd: ServerCmd) -> Result<()> {
         }
         ServerCmd::ScheduleReboot { when } => server::setup::schedule_reboot(&when),
         ServerCmd::Daemon => {
-            tracing_subscriber::fmt()
-                .with_writer(std::io::stderr)
-                .with_ansi(std::io::stderr().is_terminal())
-                .with_max_level(tracing::Level::INFO)
-                .init();
+            init_logging();
             server::daemon::run(paths).await
+        }
+        ServerCmd::SocketProxy => {
+            init_logging();
+            server::sockproxy::run(&paths, std::path::Path::new(server::sockproxy::UPSTREAM)).await
         }
         ServerCmd::Version => {
             println!("mypaas {} (traefik {TRAEFIK_VERSION})", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
     }
+}
+
+/// Logs to stderr (journald under systemd); `MYPAAS_LOG=debug` for more detail.
+fn init_logging() {
+    let level = match std::env::var("MYPAAS_LOG").as_deref() {
+        Ok("debug") => tracing::Level::DEBUG,
+        Ok("warn") => tracing::Level::WARN,
+        _ => tracing::Level::INFO,
+    };
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .with_max_level(level)
+        .init();
 }
 
 /// `mypaas server deploy`: pack, unpack and deploy like an upload, as admin.
