@@ -32,11 +32,12 @@ The full design, including the threat model, is in
 You need a Linux server with Docker and systemd, and a DNS name for the admin
 API (here `paas.example.com`) pointing at it. Ports 80 and 443 must be free.
 
-Build the binary and copy it to the server:
+Build the statically linked binary (needs only Docker on your machine; it runs
+on any x86_64 Linux, whatever its glibc) and copy it to the server:
 
 ```sh
-cargo build --release
-scp target/release/mypaas root@server:/usr/local/bin/mypaas
+scripts/build-static.sh
+scp target-musl/x86_64-unknown-linux-musl/release/mypaas root@server:/usr/local/bin/mypaas
 ```
 
 On your laptop, create a key (or use an existing `~/.ssh/id_ed25519`) and
@@ -414,6 +415,25 @@ The end-to-end tests start real daemons, socket proxies and Traefik
 containers. They need Docker and the `busybox:1.36` and `traefik:v3.6.1`
 images, use unique names and clean up after themselves.
 
+### Testing on a real systemd server, locally
+
+`scripts/vm-test.sh` boots a Debian 13 VM under QEMU/KVM and runs the whole
+thing as on a server: `server init`, the systemd units, Traefik on ports 80 and
+443, deploys from this machine, the shared Postgres example, traffic stats and
+a reboot. It needs `qemu-system-x86_64`, `qemu-img` and `genisoimage`, but no
+root and no libvirt; only loopback ports are forwarded to the VM.
+
+```sh
+scripts/build-static.sh
+scripts/vm-test.sh up       # first time: downloads and verifies the cloud image
+scripts/vm-test.sh test     # can be run again on the same VM
+scripts/vm-test.sh ssh      # look around
+scripts/vm-test.sh down
+```
+
+Let's Encrypt is not part of it: Traefik serves its default certificate, and
+the client reaches the daemon through an SSH tunnel.
+
 For local experiments, the client also accepts a plain-HTTP remote on
 loopback, e.g. `mypaas -r http://127.0.0.1:18088 ls` against a daemon started
 with `MYPAAS_HOME=/tmp/x mypaas server daemon`.
@@ -438,11 +458,11 @@ The source is laid out like this:
 
 ## Status
 
-All four phases of the design are implemented and covered by tests. The end
-to end tests run against real Docker and Traefik, but not yet on a real server.
-Still to do:
+All four phases of the design are implemented and covered by tests, including
+a full run on a local systemd VM. Still to do:
 
-- A statically linked (musl) release build.
-- A trial on a real server: systemd units, Let's Encrypt certificates, ports
-  80 and 443, and deploys from CI.
-- Signing through `ssh-agent`, an open question in the design.
+- A trial on a public server: real Let's Encrypt certificates and deploys
+  from CI.
+
+Signing through `ssh-agent` is deliberately not supported: the client reads
+its key from a file or `MYPAAS_PRIVATE_KEY` and depends on nothing from SSH.

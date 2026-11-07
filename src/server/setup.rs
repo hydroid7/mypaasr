@@ -58,7 +58,7 @@ pub fn init(paths: &Paths, domain: &str, email: &str, key: Option<&str>) -> Resu
 
     if let Some(key) = key {
         let text = read_key_arg(key)?;
-        add_key(paths, &text, "admin", &[Scope::Admin], None)?;
+        add_init_key(paths, &text)?;
     }
     let has_keys = auth::parse_authorized_keys(&std::fs::read_to_string(paths.authorized_keys())?)?.len();
     if has_keys == 0 {
@@ -427,6 +427,26 @@ pub fn add_key(paths: &Paths, public: &str, name: &str, scopes: &[Scope], expire
     Ok(entry)
 }
 
+/// The `--key` of `server init`: added as `admin`, or `admin-2`, `admin-3`… if
+/// that name is taken, and left alone if it is already authorized, so running
+/// init again never fails.
+fn add_init_key(paths: &Paths, public: &str) -> Result<()> {
+    let first = public.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#')).context("no public key given")?;
+    let (_, _, key_id) = auth::parse_public_key(first)?;
+    let keys = list_keys(paths)?;
+    if let Some(k) = keys.iter().find(|k| k.key_id == key_id) {
+        println!("key {} is already authorized as {}", key_id, k.name);
+        return Ok(());
+    }
+    let name = std::iter::once("admin".to_string())
+        .chain((2..).map(|n| format!("admin-{n}")))
+        .find(|n| !keys.iter().any(|k| &k.name == n))
+        .unwrap();
+    let k = add_key(paths, public, &name, &[Scope::Admin], None)?;
+    println!("added {} ({}) with the admin scope", k.name, k.key_id);
+    Ok(())
+}
+
 pub fn list_keys(paths: &Paths) -> Result<Vec<AuthorizedKey>> {
     auth::parse_authorized_keys(&std::fs::read_to_string(paths.authorized_keys()).unwrap_or_default())
 }
@@ -523,6 +543,14 @@ mod tests {
         std::fs::write(paths.secrets_file("a"), "X = \"1\"\n").unwrap();
         init(&paths, "paas2.example.com", "", None).unwrap();
         assert_eq!(list_keys(&paths).unwrap().len(), 1);
+        // The same --key again is a no-op, a second one gets its own name.
+        init(&paths, "paas2.example.com", "", Some(keyfile.to_str().unwrap())).unwrap();
+        assert_eq!(list_keys(&paths).unwrap().len(), 1);
+        let (_, other) = test_key();
+        std::fs::write(&keyfile, &other).unwrap();
+        init(&paths, "paas2.example.com", "", Some(keyfile.to_str().unwrap())).unwrap();
+        let names: Vec<String> = list_keys(&paths).unwrap().into_iter().map(|k| k.name).collect();
+        assert_eq!(names, vec!["admin", "admin-2"]);
         assert!(paths.secrets_file("a").exists());
         assert_eq!(ServerConfig::load(&paths).unwrap().domain, "paas2.example.com");
     }
