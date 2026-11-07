@@ -53,18 +53,19 @@ fn service_table(v: &Value, out: Output) -> Vec<String> {
     let mut lines = vec![paint(
         out,
         BOLD,
-        &format!("{:<24} {:<8} {:<10} {:<5} {:>7} {:>10}  URLS", "SERVICE", "REPLICAS", "HEALTH", "AGE", "CPU", "MEM"),
+        &format!("{:<24} {:<8} {:<10} {:<5} {:>8} {:>7} {:>10}  URLS", "SERVICE", "REPLICAS", "HEALTH", "AGE", "REQ/1H", "CPU", "MEM"),
     )];
     let now = auth::unix_now();
     for s in v["services"].as_array().into_iter().flatten() {
         let health = s["health"].as_str().unwrap_or("?");
         let urls: Vec<&str> = s["urls"].as_array().into_iter().flatten().filter_map(|u| u.as_str()).collect();
         lines.push(format!(
-            "{} {} {} {:<5} {:>7} {:>10}  {}",
+            "{} {} {} {:<5} {:>8} {:>7} {:>10}  {}",
             cell(out, None, s["service"].as_str().unwrap_or("?"), 24),
             cell(out, None, &format!("{}/{}", s["running"], s["wanted"]), 8),
             cell(out, Some(health_color(health)), health, 10),
             age(now.saturating_sub(s["deployed_at"].as_u64().unwrap_or(now))),
+            s["requests_1h"].as_u64().unwrap_or(0),
             format!("{:.1}%", s["cpu_percent"].as_f64().unwrap_or(0.0)),
             human(s["mem_bytes"].as_u64().unwrap_or(0)),
             urls.join(" ")
@@ -168,6 +169,89 @@ pub struct LogArgs {
     pub tail: Option<u64>,
     pub since: Option<String>,
     pub container: Option<u32>,
+}
+
+/// `▁▂▃▅▇` from the values, scaled to the largest.
+pub fn sparkline(values: &[u64]) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let max = values.iter().copied().max().unwrap_or(0);
+    values
+        .iter()
+        .map(|&v| if max == 0 || v == 0 { ' ' } else { BARS[((v * 7).div_ceil(max)) as usize] })
+        .collect()
+}
+
+fn percent(part: u64, total: u64) -> String {
+    if total == 0 { "-".into() } else { format!("{:.1}%", part as f64 * 100.0 / total as f64) }
+}
+
+fn ms(v: &Value) -> String {
+    match v.as_f64() {
+        None => "-".into(),
+        Some(x) if x < 10.0 => format!("{x:.1}ms"),
+        Some(x) if x < 1000.0 => format!("{x:.0}ms"),
+        Some(x) => format!("{:.1}s", x / 1000.0),
+    }
+}
+
+pub async fn stats(remote: Option<&str>, service: &str, since: &str, by: Option<&str>, out: Output) -> Result<()> {
+    check_service(service)?;
+    parse_duration_ms(since)?;
+    let mut path = format!("/v1/services/{service}/stats?since={since}");
+    if let Some(b) = by {
+        if b != "hour" && b != "day" {
+            bail!("--by must be hour or day");
+        }
+        path.push_str(&format!("&by={b}"));
+    }
+    let api = Api::connect(remote)?;
+    let v: Value = api.signed(Method::GET, &path, Vec::new()).await?.json().await?;
+    if out.json {
+        println!("{v}");
+        return Ok(());
+    }
+    let by_day = v["by"] == "day";
+    let total = &v["total"];
+    let n = total["requests"].as_u64().unwrap_or(0);
+    let class = |b: &Value, c: &str| b["status"][c].as_u64().unwrap_or(0);
+    let buckets: Vec<&Value> = v["buckets"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
+    println!(
+        "{}  last {since} by {}  {} requests  2xx {}  4xx {}  5xx {}  p50 {}  p95 {}",
+        paint(out, BOLD, service),
+        if by_day { "day" } else { "hour" },
+        n,
+        percent(class(total, "2xx"), n),
+        percent(class(total, "4xx"), n),
+        paint(out, if class(total, "5xx") > 0 { RED } else { GREEN }, &percent(class(total, "5xx"), n)),
+        ms(&total["p50_ms"]),
+        ms(&total["p95_ms"]),
+    );
+    let counts: Vec<u64> = buckets.iter().map(|b| b["requests"].as_u64().unwrap_or(0)).collect();
+    let errors: Vec<u64> = buckets.iter().map(|b| class(b, "5xx")).collect();
+    println!("requests {}", sparkline(&counts));
+    if errors.iter().any(|&e| e > 0) {
+        println!("5xx      {}", paint(out, RED, &sparkline(&errors)));
+    }
+    println!();
+    println!("{}", paint(out, BOLD, &format!("{:<17} {:>8} {:>7} {:>7} {:>7} {:>7} {:>8} {:>8}", "TIME (UTC)", "REQS", "2XX", "3XX", "4XX", "5XX", "P50", "P95")));
+    for b in buckets.iter().filter(|b| b["requests"].as_u64() != Some(0)) {
+        let t = b["t"].as_u64().unwrap_or(0);
+        let when = if by_day { auth::format_date(t) } else { format_time(t).trim_end_matches(" UTC").to_string() };
+        println!(
+            "{when:<17} {:>8} {:>7} {:>7} {:>7} {:>7} {:>8} {:>8}",
+            b["requests"].as_u64().unwrap_or(0),
+            class(b, "2xx"),
+            class(b, "3xx"),
+            class(b, "4xx"),
+            class(b, "5xx"),
+            ms(&b["p50_ms"]),
+            ms(&b["p95_ms"])
+        );
+    }
+    if n == 0 {
+        println!("{}", paint(out, DIM, "no requests in this period"));
+    }
+    Ok(())
 }
 
 /// Calls `f` for each complete line of a streamed body.
@@ -508,12 +592,21 @@ mod tests {
     fn table_without_colour() {
         let v = serde_json::json!({ "services": [{
             "service": "shop", "running": 2, "wanted": 2, "health": "healthy",
-            "cpu_percent": 1.25, "mem_bytes": 1048576, "urls": ["https://shop.example.com"], "deployed_at": 0
+            "cpu_percent": 1.25, "mem_bytes": 1048576, "urls": ["https://shop.example.com"], "deployed_at": 0, "requests_1h": 1234
         }]});
         let lines = service_table(&v, Output::default());
         assert!(lines[0].starts_with("SERVICE"));
         assert!(lines[1].contains("shop") && lines[1].contains("2/2") && lines[1].contains("1.2%") && lines[1].contains("1.0 MiB"));
+        assert!(lines[1].contains("1234"));
         assert!(!lines[1].contains('\x1b'));
+    }
+
+    #[test]
+    fn sparklines() {
+        assert_eq!(sparkline(&[0, 1, 2, 4, 8]), " ▂▃▅█");
+        assert_eq!(sparkline(&[0, 0]), "  ");
+        assert_eq!(sparkline(&[5, 5]), "██");
+        assert_eq!(sparkline(&[]), "");
     }
 
     #[test]

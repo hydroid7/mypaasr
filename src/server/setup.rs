@@ -6,7 +6,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::auth::{self, AuthorizedKey, Scope};
-use super::sockproxy;
+use super::{sockproxy, stats};
 use crate::config::{Paths, ROUTER_CONTAINER, ServerConfig, TRAEFIK_VERSION, write_atomic};
 
 pub const SYSTEMD_UNIT: &str = "/etc/systemd/system/mypaasd.service";
@@ -22,6 +22,7 @@ pub fn init(paths: &Paths, domain: &str, email: &str, key: Option<&str>) -> Resu
         paths.volumes_dir(),
         paths.tmp(),
         sockproxy::socket_dir(paths),
+        stats::log_dir(paths),
         paths.root.join("docker-config"),
     ] {
         std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
@@ -98,6 +99,32 @@ pub fn write_traefik_files(paths: &Paths, cfg: &ServerConfig) -> Result<()> {
 
 pub fn traefik_toml(cfg: &ServerConfig) -> String {
     let email = if cfg.email.is_empty() { String::new() } else { format!("email = \"{}\"\n", cfg.email) };
+    let access_log = if cfg.stats.enabled {
+        format!(
+            r#"
+# Only what the traffic stats need: no client addresses, paths or headers.
+[accessLog]
+filePath = "{log}/access.log"
+format = "json"
+bufferingSize = 100
+
+[accessLog.fields]
+defaultMode = "drop"
+
+[accessLog.fields.names]
+ServiceName = "keep"
+DownstreamStatus = "keep"
+Duration = "keep"
+StartUTC = "keep"
+
+[accessLog.fields.headers]
+defaultMode = "drop"
+"#,
+            log = stats::LOG_MOUNT
+        )
+    } else {
+        String::new()
+    };
     let endpoint = if cfg.router.socket_proxy {
         format!("# Read-only access through `mypaas server socket-proxy`.\nendpoint = \"unix://{PROXY_MOUNT}/docker.sock\"\n")
     } else {
@@ -133,7 +160,7 @@ keyType = "EC256"
 
 [certificatesResolvers.default.acme.httpChallenge]
 entryPoint = "web"
-"#
+{access_log}"#
     )
 }
 
@@ -359,6 +386,8 @@ fn restart_router(paths: &Paths) -> Result<()> {
             &mount(&paths.acme_json(), "/acme.json", false),
             "--mount",
             &docker_mount,
+            "--mount",
+            &mount(&stats::log_dir(paths), stats::LOG_MOUNT, false),
             &image,
             "--configFile=/traefik.toml",
         ],
@@ -473,10 +502,14 @@ mod tests {
         );
         assert_eq!(s["http"]["services"]["mypaas-daemon"]["loadBalancer"]["servers"][0]["url"].as_str(), Some("http://127.0.0.1:88"));
         assert_eq!(t["providers"]["docker"]["endpoint"].as_str(), Some("unix:///mypaas-run/docker.sock"));
+        assert_eq!(t["accessLog"]["fields"]["defaultMode"].as_str(), Some("drop"), "privacy: drop by default");
+        assert_eq!(t["accessLog"]["fields"]["names"].as_table().unwrap().len(), 4);
         let mut raw = cfg.clone();
         raw.router.socket_proxy = false;
+        raw.stats.enabled = false;
         let t: toml::Value = toml::from_str(&traefik_toml(&raw)).unwrap();
         assert!(t["providers"]["docker"].get("endpoint").is_none());
+        assert!(t.get("accessLog").is_none());
     }
 
     #[test]

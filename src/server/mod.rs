@@ -8,6 +8,7 @@ pub mod guard;
 pub mod owner;
 pub mod setup;
 pub mod sockproxy;
+pub mod stats;
 
 use std::fs::File;
 use std::os::fd::AsRawFd;

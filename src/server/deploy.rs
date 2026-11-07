@@ -431,7 +431,7 @@ impl Run<'_> {
         let Some(hc) = spec.healthcheck.as_ref().filter(|_| spec.scale > 0) else {
             tokio::time::sleep(NO_HEALTHCHECK_WAIT).await;
             if !is_running(name).await {
-                bail!("container {name} stopped right after starting");
+                bail!("container {name} exited or restarted right after starting");
             }
             return Ok(());
         };
@@ -439,7 +439,7 @@ impl Run<'_> {
         let mut last_err = String::from("no answer");
         while start.elapsed() < READY_TIMEOUT {
             if !is_running(name).await {
-                bail!("container {name} stopped before it became healthy");
+                bail!("container {name} exited or restarted before it became healthy");
             }
             match probe(name, spec, hc).await {
                 Ok(()) => {
@@ -615,12 +615,15 @@ pub async fn remove_service(paths: &Paths, service: &str, progress: &Progress) -
 }
 
 /// After a crash in the middle of a deploy: services that have `.old.` containers
-/// and no running new ones get their old containers back.
-pub async fn recover(progress: &Progress) -> Result<()> {
+/// and no running new ones get their old containers back. Only services this
+/// installation deployed are touched, never other containers that happen to
+/// carry a `mypaas.service` label.
+pub async fn recover(paths: &Paths, progress: &Progress) -> Result<()> {
     let all = list_containers(None).await?;
     let mut services: Vec<&str> = all.iter().map(|c| c.service.as_str()).collect();
     services.sort();
     services.dedup();
+    services.retain(|svc| crate::spec::is_valid_name(svc) && paths.service_dir(svc).join("current.json").exists());
     for svc in services {
         let mine: Vec<_> = all.iter().filter(|c| c.service == svc).collect();
         let olds: Vec<_> = mine.iter().filter(|c| c.name.contains(".old.")).collect();

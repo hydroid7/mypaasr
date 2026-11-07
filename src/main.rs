@@ -65,6 +65,16 @@ enum Command {
     },
     /// Live view of all services; q quits.
     Top,
+    /// Requests, status classes and p50/p95 latency from the access log.
+    Stats {
+        service: String,
+        /// How far back, e.g. 24h, 7d, 90d.
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// Bucket size; hour up to 2 days, day beyond, unless given.
+        #[arg(long, value_parser = ["hour", "day"])]
+        by: Option<String>,
+    },
     /// Manage a service's secrets; values are never shown.
     #[command(subcommand)]
     Secret(SecretCmd),
@@ -220,6 +230,7 @@ async fn run(cli: Cli, out: Output) -> Result<()> {
             client::ops::logs(remote, &service, client::ops::LogArgs { follow, tail, since, container }, out).await
         }
         Command::Top => client::ops::top(remote, out).await,
+        Command::Stats { service, since, by } => client::ops::stats(remote, &service, &since, by.as_deref(), out).await,
         Command::Secret(SecretCmd::Set { service, key }) => client::ops::secret_set(remote, &service, &key, out).await,
         Command::Secret(SecretCmd::Ls { service }) => client::ops::secret_ls(remote, &service, out).await,
         Command::Secret(SecretCmd::Rm { service, key }) => client::ops::secret_rm(remote, &service, &key, out).await,

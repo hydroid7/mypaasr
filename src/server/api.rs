@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 
 use super::deploy::{self, DeployRecord, service_network, shared_network};
 use super::docker::{ContainerInfo, Usage, container_stats, list_containers};
+use super::stats::StatsStore;
 use crate::config::{Paths, load_secrets, save_secrets};
 use crate::spec::{ServiceSpec, VolumeSource, is_valid_env_name};
 
@@ -71,7 +72,7 @@ fn sum_usage(containers: &[&ContainerInfo], usage: &HashMap<String, Usage>) -> U
     })
 }
 
-pub async fn list_services(paths: &Paths) -> Result<Value> {
+pub async fn list_services(paths: &Paths, stats: &std::sync::Mutex<StatsStore>) -> Result<Value> {
     let all = list_containers(None).await?;
     let running: Vec<&str> = all.iter().filter(|c| c.running).map(|c| c.name.as_str()).collect();
     let usage = container_stats(&running).await.unwrap_or_else(|e| {
@@ -88,10 +89,16 @@ pub async fn list_services(paths: &Paths) -> Result<Value> {
         async move { health(&rec.spec, &mine).await }
     });
     let healths = futures_util::future::join_all(checks).await;
+    let now = crate::auth::unix_now();
+    let traffic: Vec<u64> = {
+        let stats = stats.lock().unwrap_or_else(|e| e.into_inner());
+        rows.iter().map(|(name, _)| stats.requests_last_hour(name, now)).collect()
+    };
     let services: Vec<Value> = rows
         .iter()
         .zip(healths)
-        .map(|((name, rec), health)| {
+        .zip(traffic)
+        .map(|(((name, rec), health), requests_1h)| {
             let mine = current_containers(&all, name);
             let u = sum_usage(&mine, &usage);
             json!({
@@ -99,6 +106,7 @@ pub async fn list_services(paths: &Paths) -> Result<Value> {
                 "running": mine.iter().filter(|c| c.running).count(),
                 "wanted": rec.spec.scale.max(1),
                 "health": health,
+                "requests_1h": requests_1h,
                 "cpu_percent": u.cpu_percent,
                 "mem_bytes": u.mem_bytes,
                 "urls": rec.spec.urls.iter().map(|u| u.to_url()).collect::<Vec<_>>(),

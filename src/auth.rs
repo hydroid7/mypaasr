@@ -223,6 +223,20 @@ pub fn format_date(unix: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// `2026-11-07T11:21:12.675180123Z` (UTC only, fraction optional) to unix seconds.
+pub fn parse_rfc3339_utc(s: &str) -> Option<u64> {
+    let s = s.strip_suffix('Z')?;
+    let (date, time) = s.split_once('T')?;
+    let day = parse_date(date).ok()?;
+    let time = time.split('.').next()?;
+    let mut parts = time.split(':').map(|p| p.parse::<u64>().ok());
+    let (h, m, sec) = (parts.next()??, parts.next()??, parts.next()??);
+    if parts.next().is_some() || h > 23 || m > 59 || sec > 60 {
+        return None;
+    }
+    Some(day + h * 3600 + m * 60 + sec)
+}
+
 fn days_in_month(y: i64, m: u32) -> u32 {
     match m {
         2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
@@ -317,5 +331,10 @@ pub(crate) mod tests {
         assert_eq!(format_date(parse_date("2024-02-29").unwrap()), "2024-02-29");
         assert!(parse_date("2023-02-29").is_err());
         assert!(parse_date("2023-13-01").is_err());
+        assert_eq!(parse_rfc3339_utc("1970-01-01T00:01:05.123456789Z"), Some(65));
+        assert_eq!(parse_rfc3339_utc("2000-03-01T00:00:00Z"), Some(951_868_800));
+        assert_eq!(parse_rfc3339_utc("2000-03-01T00:00:00+02:00"), None);
+        assert_eq!(parse_rfc3339_utc("2000-03-01T24:00:00Z"), None);
+        assert_eq!(parse_rfc3339_utc("garbage"), None);
     }
 }

@@ -190,11 +190,12 @@ pub async fn ensure_network(name: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Running and never restarted. A crash-looping container also reports
+/// `State.Running` while its restart policy brings it back, so the restart
+/// count is what tells a new container that keeps dying from a healthy one.
 pub async fn is_running(container: &str) -> bool {
-    matches!(
-        docker(&["inspect", "--format", "{{.State.Running}}", container]).await.as_deref().map(str::trim),
-        Ok("true")
-    )
+    let out = docker(&["inspect", "--format", "{{.State.Status}} {{.RestartCount}}", container]).await;
+    matches!(out.as_deref().map(str::trim), Ok("running 0"))
 }
 
 pub async fn container_ip(container: &str, network: &str) -> Result<String> {

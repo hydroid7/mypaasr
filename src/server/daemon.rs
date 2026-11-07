@@ -25,7 +25,7 @@ use tokio::sync::Semaphore;
 
 use super::deploy::{self, Caller};
 use super::guard::{Backoff, IpKey, IssueError, NonceResult, Nonces, RateLimiter, SIG_CHECKS_PER_SEC, TICKET_TTL, Ticket, Tickets};
-use super::{DeployLock, Progress, api, clean_tmp, free_disk};
+use super::{DeployLock, Progress, api, clean_tmp, free_disk, stats};
 use crate::auth::{self, AuthorizedKey, Need, Scope};
 use crate::bundle::{UnpackLimits, unpack};
 use crate::config::{Paths, ServerConfig};
@@ -62,11 +62,14 @@ pub struct State {
     guards: Mutex<Guards>,
     /// Serializes read-modify-write of the secrets files.
     secrets_lock: Mutex<()>,
+    stats: Arc<Mutex<stats::StatsStore>>,
 }
 
 impl State {
     pub fn new(paths: Paths) -> State {
+        let retention = ServerConfig::load(&paths).map(|c| c.stats.retention_days).unwrap_or(90);
         State {
+            stats: Arc::new(Mutex::new(stats::StatsStore::load(&paths, retention))),
             paths,
             keys: Mutex::new(KeyCache { keys: Vec::new(), checked: None, mtime: None }),
             guards: Mutex::new(Guards {
@@ -124,7 +127,7 @@ pub async fn run(paths: Paths) -> Result<()> {
         Some(_lock) => {
             clean_tmp(&paths)?;
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            deploy::recover(&tx).await.unwrap_or_else(|e| tracing::error!("recovery failed: {e:#}"));
+            deploy::recover(&paths, &tx).await.unwrap_or_else(|e| tracing::error!("recovery failed: {e:#}"));
             drop(tx);
             while let Some(line) = rx.recv().await {
                 tracing::warn!("{line}");
@@ -134,7 +137,11 @@ pub async fn run(paths: Paths) -> Result<()> {
     }
     let listener = TcpListener::bind(addr).await.with_context(|| format!("cannot listen on {addr}"))?;
     tracing::info!("mypaas daemon listening on {addr}");
-    serve(listener, Arc::new(State::new(paths))).await
+    let state = Arc::new(State::new(paths.clone()));
+    if cfg.stats.enabled {
+        tokio::spawn(stats::run(paths, state.stats.clone()));
+    }
+    serve(listener, state).await
 }
 
 pub async fn serve(listener: TcpListener, state: Arc<State>) -> Result<()> {
@@ -235,6 +242,7 @@ enum Route {
     Services,
     Status(String),
     Logs(String),
+    Stats(String),
     Rollback(String),
     Remove(String),
     Secrets(String),
@@ -251,6 +259,7 @@ fn route(method: &Method, path: &str) -> Option<Route> {
         (&Method::GET, ["services"]) => Some(Route::Services),
         (&Method::GET, ["services", n]) => Some(Route::Status(name(n)?)),
         (&Method::GET, ["services", n, "logs"]) => Some(Route::Logs(name(n)?)),
+        (&Method::GET, ["services", n, "stats"]) => Some(Route::Stats(name(n)?)),
         (&Method::POST, ["services", n, "rollback"]) => Some(Route::Rollback(name(n)?)),
         (&Method::DELETE, ["services", n]) => Some(Route::Remove(name(n)?)),
         (&Method::GET, ["services", n, "secrets"]) => Some(Route::Secrets(name(n)?)),
@@ -317,7 +326,7 @@ async fn handle_inner(state: &Arc<State>, ipk: IpKey, req: Request<Incoming>) ->
     };
     let need = match &route {
         Route::DeployTickets => None, // depends on the body, checked in the handler
-        Route::Services | Route::Status(_) => Some(Need::Read),
+        Route::Services | Route::Status(_) | Route::Stats(_) => Some(Need::Read),
         Route::Logs(_) => Some(Need::Logs),
         Route::Rollback(n) => Some(Need::Deploy(n)),
         Route::Remove(n) => Some(Need::Rm(n)),
@@ -335,7 +344,8 @@ async fn handle_inner(state: &Arc<State>, ipk: IpKey, req: Request<Incoming>) ->
             Err(Reject::Denied(reason)) => return (denied(), Outcome::Denied(reason)),
             Err(Reject::Response(r)) => r,
         },
-        Route::Services => json_result(api::list_services(&state.paths).await.map(Some)),
+        Route::Services => json_result(api::list_services(&state.paths, &state.stats).await.map(Some)),
+        Route::Stats(name) => traffic(state, &name, &query),
         Route::Status(name) => json_result(api::status(&state.paths, &name).await),
         Route::Logs(name) => logs(&name, &query).await,
         Route::Rollback(name) => rollback(state, &key, name),
@@ -613,12 +623,38 @@ fn remove(state: &Arc<State>, service: String) -> Response<Body> {
     };
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let paths = state.paths.clone();
+    let stats = state.stats.clone();
     tokio::spawn(async move {
         let _lock = lock;
         let result = deploy::remove_service(&paths, &service, &tx).await;
+        if result.is_ok() {
+            stats.lock().unwrap_or_else(|e| e.into_inner()).remove(&service);
+        }
         finish(&tx, &format!("rm {service}"), result);
     });
     streamed(rx)
+}
+
+/// `?since=7d&by=day`; by hour up to two days, by day beyond.
+fn traffic(state: &Arc<State>, service: &str, query: &str) -> Response<Body> {
+    let mut since = 86_400;
+    let mut by = None;
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        match pair.split_once('=') {
+            Some(("since", v)) => match crate::spec::parse_duration_ms(v) {
+                Ok(ms) if (3_600_000..=3650 * 86_400_000).contains(&ms) => since = ms / 1000,
+                _ => return error(StatusCode::BAD_REQUEST, "since must be a duration between 1h and 3650d"),
+            },
+            Some(("by", v @ ("hour" | "day"))) => by = Some(v == "day"),
+            _ => return error(StatusCode::BAD_REQUEST, "unknown stats option; use since and by=hour|day"),
+        }
+    }
+    let by_day = by.unwrap_or(since > 2 * 86_400);
+    if !by_day && since > 14 * 86_400 {
+        return error(StatusCode::BAD_REQUEST, "by=hour covers at most 14 days");
+    }
+    let v = state.stats.lock().unwrap_or_else(|e| e.into_inner()).query(service, since, by_day, auth::unix_now());
+    json(StatusCode::OK, v)
 }
 
 /// A JSON document, or 404 when the service does not exist.
@@ -939,6 +975,35 @@ mod tests {
         assert!(text.contains("unknown or expired ticket"), "the reused ticket must be logged as denied");
         assert!(!text.contains(&value), "secret value logged");
         assert!(!text.contains(&ticket), "ticket logged");
+    }
+
+    #[tokio::test]
+    async fn traffic_stats_endpoint() {
+        let srv = start("read").await;
+        let now = auth::unix_now();
+        {
+            let mut st = srv.state.stats.lock().unwrap();
+            st.record("shop", now - 60, 200, 5_000_000, now);
+            st.record("shop", now - 3 * 86_400, 503, 5_000_000, now);
+        }
+        let get = |path: &str, ip: &str| signed(&srv, "GET", path, "", ip);
+        let (status, text) = raw(srv.addr, &get("/v1/services/shop/stats", "7.0.0.1")).await;
+        assert_eq!(status, 200, "{text}");
+        let v = json_body(&text);
+        assert_eq!((v["by"].as_str(), v["total"]["requests"].as_u64()), (Some("hour"), Some(1)), "default: last 24h by hour");
+        let v = json_body(&raw(srv.addr, &get("/v1/services/shop/stats?since=7d", "7.0.0.1")).await.1);
+        assert_eq!(v["by"], "day");
+        assert_eq!(v["total"]["requests"], 2);
+        assert_eq!(v["total"]["status"]["5xx"], 1);
+        assert_eq!(v["buckets"].as_array().unwrap().len(), 8, "every day in range, empty ones included");
+        for bad in ["?since=10m", "?since=forever", "?by=week", "?since=30d&by=hour", "?colour=red"] {
+            let (status, _) = raw(srv.addr, &get(&format!("/v1/services/shop/stats{bad}"), "7.0.0.2")).await;
+            assert_eq!(status, 400, "{bad}");
+        }
+        // Stats need the read scope like everything else.
+        let (k, id) = srv.add_key("logs", None);
+        let req = signed_as(&k, &id, "GET", "/v1/services/shop/stats", "", "7.0.0.3", now);
+        assert_eq!(raw(srv.addr, &req).await.0, 403);
     }
 
     #[tokio::test]

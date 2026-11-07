@@ -346,3 +346,128 @@ fn containers_run_hardened() {
     assert!(!out.status.success(), "the root filesystem is read-only");
     assert!(Command::new("docker").args(["exec", &svc, "touch", "/tmp/x"]).output().unwrap().status.success(), "/tmp is writable");
 }
+
+/// Runs the socket proxy and a real Traefik for this test, on loopback ports.
+struct Router {
+    proxy: Child,
+    container: String,
+    web_port: u16,
+}
+
+impl Router {
+    fn start(env: &Env) -> Router {
+        let proxy = Command::new(BIN)
+            .args(["server", "socket-proxy"])
+            .env("MYPAAS_HOME", &env.home)
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let web_port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let tls_port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let cfg = std::fs::read_to_string(env.home.join("traefik.toml"))
+            .unwrap()
+            .replace("address = \":80\"", &format!("address = \"127.0.0.1:{web_port}\""))
+            .replace("address = \":443\"", &format!("address = \"127.0.0.1:{tls_port}\""));
+        let cfg_path = env.dir.path().join("traefik-test.toml");
+        std::fs::write(&cfg_path, cfg).unwrap();
+        let container = format!("{}-router", env.tag);
+        let mount = |src: &Path, dst: &str, ro: bool| {
+            format!("type=bind,source={},target={dst}{}", src.display(), if ro { ",readonly" } else { "" })
+        };
+        let ok = docker_ok(&[
+            "run", "-d", "--name", &container, "--network", "host",
+            "--mount", &mount(&cfg_path, "/traefik.toml", true),
+            "--mount", &mount(&env.home.join("staticroutes.toml"), "/staticroutes.toml", true),
+            "--mount", &mount(&env.home.join("run"), "/mypaas-run", true),
+            "--mount", &mount(&env.home.join("logs"), "/mypaas-logs", false),
+            "traefik:v3.6.1", "--configFile=/traefik.toml",
+        ]);
+        assert!(ok, "cannot start traefik");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while std::net::TcpStream::connect(("127.0.0.1", web_port)).is_err() {
+            assert!(Instant::now() < deadline, "traefik did not start");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Router { proxy, container, web_port }
+    }
+
+    /// GET through Traefik; returns the status code.
+    fn get(&self, host: &str, path: &str) -> u16 {
+        use std::io::Read;
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", self.web_port)).unwrap();
+        write!(s, "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").unwrap();
+        let mut buf = String::new();
+        let _ = s.read_to_string(&mut buf);
+        buf.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0)
+    }
+}
+
+impl Drop for Router {
+    fn drop(&mut self) {
+        let _ = self.proxy.kill();
+        let _ = self.proxy.wait();
+        docker(&["rm", "-f", &self.container]);
+    }
+}
+
+/// Phase 4 exit test: a known mix of traffic through the real Traefik shows up
+/// in the stats with exact counts and plausible latencies, and the access log
+/// holds no client addresses or paths.
+#[test]
+#[ignore = "needs docker and the traefik:v3.6.1 image"]
+fn traffic_stats_match_the_requests_sent() {
+    let env = Env::new(&[]);
+    let svc = env.svc("traffic");
+    let host = format!("{svc}.test.local");
+    let body = "RUN mkdir -p /www/cgi-bin && echo ok > /www/index.html \
+        && printf '#!/bin/sh\\nsleep 0.3\\nprintf \"Content-Type: text/plain\\\\r\\\\n\\\\r\\\\nslow\"\\n' > /www/cgi-bin/slow \
+        && printf '#!/bin/sh\\nprintf \"HTTP/1.1 500 Internal Server Error\\\\r\\\\nContent-Type: text/plain\\\\r\\\\n\\\\r\\\\nboom\"\\n' > /www/cgi-bin/fail \
+        && chmod +x /www/cgi-bin/*\nUSER 65534\nCMD [\"httpd\", \"-f\", \"-p\", \"8080\", \"-h\", \"/www\"]";
+    let conf = format!("# mypaas.port=8080\n# mypaas.url=http://{host}");
+    let router = Router::start(&env);
+    let (code, out) = env.push(&env.project("traffic", &conf, body));
+    assert_eq!(code, 0, "{out:?}");
+
+    // Traefik picks the new container up from Docker events.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while router.get(&host, "/") != 200 {
+        assert!(Instant::now() < deadline, "traefik never routed to the service");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let sent = [("/", 200, 19), ("/missing", 404, 5), ("/cgi-bin/fail", 500, 3), ("/cgi-bin/slow", 200, 4)];
+    for (path, want, n) in sent {
+        for _ in 0..n {
+            assert_eq!(router.get(&host, path), want, "{path}");
+        }
+    }
+    let expected = 1 + 19 + 5 + 3 + 4;
+
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let stats = loop {
+        let out = env.client(&["--json", "stats", &svc, "--since", "2h"]);
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+        if v["total"]["requests"] == expected {
+            break v;
+        }
+        assert!(Instant::now() < deadline, "stats never reached {expected}: {v}");
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    let total = &stats["total"];
+    assert_eq!(total["status"]["2xx"], 24);
+    assert_eq!(total["status"]["4xx"], 5);
+    assert_eq!(total["status"]["5xx"], 3);
+    let p50 = total["p50_ms"].as_f64().unwrap();
+    let p95 = total["p95_ms"].as_f64().unwrap();
+    assert!(p50 < 100.0, "p50 {p50}ms should be a fast request");
+    assert!((250.0..1000.0).contains(&p95), "p95 {p95}ms should be a 300ms request");
+
+    let ls: serde_json::Value = serde_json::from_slice(&env.client(&["--json", "ls"]).stdout).unwrap();
+    let row = ls["services"].as_array().unwrap().iter().find(|s| s["service"] == svc.as_str()).unwrap().clone();
+    assert_eq!(row["requests_1h"], expected);
+
+    let log = std::fs::read_to_string(env.home.join("logs/access.log")).unwrap();
+    assert!(log.lines().count() >= expected as usize);
+    for forbidden in ["127.0.0.1", "/missing", "cgi-bin", "ClientHost", "RequestPath", "User-Agent"] {
+        assert!(!log.contains(forbidden), "the access log must not contain {forbidden:?}");
+    }
+}

@@ -79,6 +79,7 @@ pub struct ServerConfig {
     pub networks: BTreeMap<String, SharedNetwork>,
     pub volumes: VolumeConfig,
     pub router: RouterConfig,
+    pub stats: StatsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +139,21 @@ pub struct RouterConfig {
     pub socket_proxy: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StatsConfig {
+    /// Traefik writes an access log (no client addresses or paths) that the
+    /// daemon turns into per-service traffic stats.
+    pub enabled: bool,
+    pub retention_days: u64,
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        StatsConfig { enabled: true, retention_days: 90 }
+    }
+}
+
 impl Default for RouterConfig {
     fn default() -> Self {
         RouterConfig { socket_proxy: true }
@@ -156,6 +172,7 @@ impl Default for ServerConfig {
             networks: BTreeMap::new(),
             volumes: VolumeConfig::default(),
             router: RouterConfig::default(),
+            stats: StatsConfig::default(),
         }
     }
 }
@@ -225,6 +242,9 @@ impl ServerConfig {
                     bail!("network {name}: invalid member pattern {m:?}");
                 }
             }
+        }
+        if !(1..=3650).contains(&self.stats.retention_days) {
+            bail!("stats.retention_days must be between 1 and 3650");
         }
         for entry in &self.volumes.allow {
             check_allowlist_entry(paths, entry)?;
