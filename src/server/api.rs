@@ -174,7 +174,6 @@ pub async fn status(paths: &Paths, service: &str) -> Result<Option<Value>> {
         "wanted": spec.scale.max(1),
         "networks": networks,
         "volumes": volumes,
-        "publish": spec.publish.iter().map(|p| format!("{}:{}->{}/{}", p.bind, p.host_port, p.container_port, if p.udp { "udp" } else { "tcp" })).collect::<Vec<_>>(),
         "env": spec.env.iter().map(|e| if e.value.is_some() { e.key.clone() } else { format!("{} (secret)", e.key) }).collect::<Vec<_>>(),
         "containers": containers,
         "last_deploy": { "deploy_id": rec.deploy_id, "time": rec.time, "key_name": rec.key_name },

@@ -4,20 +4,20 @@
 //! stored next to each deploy so a rollback can recreate the containers without
 //! the Dockerfile.
 
-use std::net::IpAddr;
 use std::path::{Component, Path};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_SCALE: u32 = 32;
+/// Keeps Traefik rules short: a rule's default priority is its length.
+pub const MAX_URL_PATH: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServiceSpec {
     pub service: String,
     pub urls: Vec<ServiceUrl>,
     pub port: u16,
-    pub publish: Vec<Publish>,
     pub volumes: Vec<Volume>,
     pub env: Vec<EnvVar>,
     pub scale: u32,
@@ -36,14 +36,6 @@ pub struct ServiceUrl {
     pub host: String,
     /// Empty, or a path starting with `/` and without a trailing `/`.
     pub path: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Publish {
-    pub bind: IpAddr,
-    pub host_port: u16,
-    pub container_port: u16,
-    pub udp: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,11 +102,6 @@ impl ServiceSpec {
     /// Features that need the `admin` scope, described for an error message.
     pub fn privileged_features(&self) -> Vec<String> {
         let mut out = Vec::new();
-        for p in &self.publish {
-            if !p.bind.is_loopback() {
-                out.push(format!("public publish on {}:{}", p.bind, p.host_port));
-            }
-        }
         for c in &self.cap_add {
             out.push(format!("cap_add {c}"));
         }
@@ -148,7 +135,6 @@ pub fn parse_spec(text: &str) -> Result<ServiceSpec> {
     let mut service = None;
     let mut urls = Vec::new();
     let mut port = None;
-    let mut publish = Vec::new();
     let mut volumes = Vec::new();
     let mut env: Vec<EnvVar> = Vec::new();
     let mut scale = None;
@@ -183,7 +169,6 @@ pub fn parse_spec(text: &str) -> Result<ServiceSpec> {
                 once(port.is_some())?;
                 port = Some(parse_port(value).with_context(ctx)?);
             }
-            "publish" => publish.push(parse_publish(value).with_context(ctx)?),
             "volume" => volumes.push(parse_volume(value).with_context(ctx)?),
             "env" => {
                 let var = parse_env(value).with_context(ctx)?;
@@ -244,20 +229,11 @@ pub fn parse_spec(text: &str) -> Result<ServiceSpec> {
     if rules.windows(2).any(|w| w[0] == w[1]) {
         bail!("the same url is given twice");
     }
-    let mut host_ports: Vec<(u16, bool)> = publish.iter().map(|p: &Publish| (p.host_port, p.udp)).collect();
-    host_ports.sort();
-    if host_ports.windows(2).any(|w| w[0] == w[1]) {
-        bail!("the same host port is published twice");
-    }
-    if scale > 0 && !publish.is_empty() {
-        bail!("mypaas.publish cannot be combined with scale above 0, the replicas would fight over the host port");
-    }
 
     Ok(ServiceSpec {
         service,
         urls,
         port: port.unwrap_or(80),
-        publish,
         volumes,
         env,
         scale,
@@ -337,6 +313,9 @@ fn parse_url(s: &str) -> Result<ServiceUrl> {
         bail!("invalid host {host:?} in url");
     }
     let path = path.trim_end_matches('/');
+    if path.len() > MAX_URL_PATH {
+        bail!("the path in url {s:?} is longer than {MAX_URL_PATH} characters");
+    }
     let path_ok = path
         .bytes()
         .all(|c| c.is_ascii_alphanumeric() || b"/-_.~".contains(&c))
@@ -365,33 +344,6 @@ fn parse_port(s: &str) -> Result<u16> {
         Ok(p) if p > 0 => Ok(p),
         _ => bail!("invalid port {s:?}"),
     }
-}
-
-fn parse_publish(s: &str) -> Result<Publish> {
-    let (s, udp) = match s.rsplit_once('/') {
-        Some((rest, "udp")) => (rest, true),
-        Some((rest, "tcp")) => (rest, false),
-        Some(_) => bail!("publish {s:?}: protocol must be tcp or udp"),
-        None => (s, false),
-    };
-    // An IPv6 bind address is written in brackets: [::1]:8080:80
-    let (bind, ports) = if let Some(rest) = s.strip_prefix('[') {
-        let (addr, rest) = rest.split_once("]:").context("publish: unclosed [ in bind address")?;
-        (Some(addr), rest)
-    } else {
-        let parts: Vec<&str> = s.split(':').collect();
-        match parts.len() {
-            2 => (None, s),
-            3 => (Some(parts[0]), &s[parts[0].len() + 1..]),
-            _ => bail!("publish {s:?}: expected [bind:]host_port:container_port[/udp]"),
-        }
-    };
-    let bind: IpAddr = match bind {
-        Some(b) => b.parse().with_context(|| format!("publish: invalid bind address {b:?}"))?,
-        None => IpAddr::from([127, 0, 0, 1]),
-    };
-    let (host, container) = ports.split_once(':').context("publish: expected host_port:container_port")?;
-    Ok(Publish { bind, host_port: parse_port(host)?, container_port: parse_port(container)?, udp })
 }
 
 fn parse_volume(s: &str) -> Result<Volume> {
@@ -614,24 +566,18 @@ mod tests {
     }
 
     #[test]
+    fn url_paths_are_bounded() {
+        assert!(parse_url(&format!("https://a.com/{}", "x".repeat(MAX_URL_PATH - 1))).is_ok());
+        assert!(parse_url(&format!("https://a.com/{}", "x".repeat(MAX_URL_PATH))).is_err());
+    }
+
+    #[test]
     fn rejects_rule_injection() {
         assert!(parse_url("https://a.com`) || Host(`b.com").is_err());
         assert!(parse_url("https://a.com/x`)").is_err());
         assert!(parse_url("https://A.com").is_err());
         assert!(parse_url("https://a.com/../x").is_err());
         assert!(parse_url("ftp://a.com").is_err());
-    }
-
-    #[test]
-    fn publish_forms() {
-        let p = parse_publish("8125:8125/udp").unwrap();
-        assert!(p.udp && p.bind.is_loopback());
-        let p = parse_publish("0.0.0.0:80:8080").unwrap();
-        assert!(!p.bind.is_loopback());
-        let p = parse_publish("[::1]:5432:5432").unwrap();
-        assert!(p.bind.is_loopback());
-        assert!(parse_publish("5432").is_err());
-        assert!(parse_publish("1:2/sctp").is_err());
     }
 
     #[test]
@@ -656,6 +602,31 @@ mod tests {
         assert_eq!(parse_duration_ms("2m").unwrap(), 120_000);
     }
 
+    /// Every Dockerfile under `examples/` must parse, so the examples cannot
+    /// drift from what mypaas accepts.
+    #[test]
+    fn examples_are_valid() {
+        fn walk(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, found);
+                } else if p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("Dockerfile")) {
+                    found.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("examples"), &mut files);
+        assert!(files.len() >= 10, "examples not found: {files:?}");
+        let mut names = std::collections::HashSet::new();
+        for f in &files {
+            let (spec, _) = parse_dockerfile(&std::fs::read_to_string(f).unwrap())
+                .unwrap_or_else(|e| panic!("{}: {e:#}", f.display()));
+            assert!(names.insert(spec.service.clone()), "{}: service name {} used twice", f.display(), spec.service);
+        }
+    }
+
     #[test]
     fn dockerfile_pull() {
         assert!(!dockerfile_info("FROM python:3.12\nUSER app\n").pull);
@@ -665,8 +636,5 @@ mod tests {
         assert!(!dockerfile_info("FROM scratch\n").pull);
     }
 
-    #[test]
-    fn publish_with_scale_rejected() {
-        assert!(parse_spec("# mypaas.service=a\n# mypaas.scale=2\n# mypaas.publish=1:1\n").is_err());
-    }
+
 }

@@ -163,8 +163,15 @@ cmd_test() {
     vm "sudo mypaas server init --domain $DOMAIN --email '' --key /tmp/client.pub"
   expect "server init is safe to run again" "already authorized" \
     vm "sudo mypaas server init --domain $DOMAIN --email '' --key /tmp/client.pub"
-  vm "sudo grep -q '^\[networks.db\]' /root/_mypaas/config.toml || printf '\n[networks.db]\nmembers = [\"postgres\", \"shop\", \"blog\"]\n' | sudo tee -a /root/_mypaas/config.toml >/dev/null"
   expect "restart all starts Traefik and the services" "restarted mypaasd" vm "sudo mypaas server restart all"
+  wait_until 30 sh -c "curl -s -o /dev/null --max-time 5 -H 'Host: $DOMAIN' http://127.0.0.1:$HTTP_PORT/" || true
+  local tls_probe="curl -sk -o /dev/null -w '%{http_code}' --max-time 5 --resolve nobody.example:$HTTPS_PORT:127.0.0.1 https://nobody.example:$HTTPS_PORT/"
+  expect "TLS for a name without a certificate is refused (strict SNI)" "000" sh -c "$tls_probe || true"
+  # The VM has no real certificates, so the rest of the test runs without strict SNI.
+  vm "sudo sed -i 's/^strict_sni = true/strict_sni = false/' /root/_mypaas/config.toml"
+  expect "restart router applies config changes" "started mypaas-router" vm "sudo mypaas server restart router"
+  wait_until 30 sh -c "curl -s -o /dev/null --max-time 5 -H 'Host: $DOMAIN' http://127.0.0.1:$HTTP_PORT/" || true
+  expect "without strict SNI, unknown names get Traefik's 404" "404" sh -c "$tls_probe"
 
   echo "== systemd"
   wait_until 30 vm "systemctl is-active mypaasd mypaas-socket-proxy" || true
@@ -177,19 +184,56 @@ cmd_test() {
   expect "the proxy has no network" "yes" vm "systemctl show mypaas-socket-proxy -p PrivateNetwork --value"
   vm "systemd-analyze security mypaasd mypaas-socket-proxy --no-pager 2>/dev/null | tail -2" | sed 's/^/     /'
 
+  echo "== hardening of the internet-facing parts"
+  expect "Traefik has no capabilities but binding ports" "[ALL] [NET_BIND_SERVICE]" \
+    vm "sudo docker inspect -f '{{.HostConfig.CapDrop}} {{.HostConfig.CapAdd}}' mypaas-router"
+  expect "Traefik runs read-only without privilege escalation" "true [no-new-privileges]" \
+    vm "sudo docker inspect -f '{{.HostConfig.ReadonlyRootfs}} {{.HostConfig.SecurityOpt}}' mypaas-router"
+  expect "Traefik's image is pinned by digest" "@sha256:" vm "sudo docker inspect -f '{{.Config.Image}}' mypaas-router"
+  check "the firewall unit is active" vm "systemctl is-active mypaas-firewall"
+  check "containers cannot reach the cloud metadata address" \
+    vm "sudo docker run --rm busybox:1.36 wget -T 5 -O- http://169.254.169.254/ 2>&1 | grep -q refused"
+  check "the metadata rule survives a Docker restart, once" \
+    vm "sudo systemctl restart docker && sleep 3 && test \$(sudo iptables -S DOCKER-USER | grep -c 169.254.0.0/16) = 1"
+  check "the router came back after the Docker restart" \
+    vm "for i in \$(seq 30); do sudo docker inspect -f '{{.State.Running}}' mypaas-router 2>/dev/null | grep -q true && exit 0; sleep 1; done; exit 1"
+
   echo "== Traefik in front of the daemon"
   expect "unsigned API request gets the uniform 403" '"error":"denied"' \
     curl -sk --max-time 5 --resolve "$DOMAIN:$HTTPS_PORT:127.0.0.1" "https://$DOMAIN:$HTTPS_PORT/v1/services"
   expect "unknown paths on the admin domain are 404" "404" \
     curl -sk -o /dev/null -w '%{http_code}' --resolve "$DOMAIN:$HTTPS_PORT:127.0.0.1" "https://$DOMAIN:$HTTPS_PORT/admin"
   expect "plain HTTP redirects to HTTPS" "301" curl -s -o /dev/null -w '%{http_code}' -H "Host: $DOMAIN" "http://127.0.0.1:$HTTP_PORT/v1/services"
-  expect "the daemon answers on port 443 from outside the VM" "denied" \
-    curl -sk --max-time 5 -X PUT -H "Authorization: Bearer $(printf 'ab%.0s' {1..32})" -H "Content-Length: 999999999" \
-    --resolve "$DOMAIN:$HTTPS_PORT:127.0.0.1" "https://$DOMAIN:$HTTPS_PORT/v1/deploy"
+  # A bad ticket is refused from the headers, and over HTTP/2 (what the client
+  # negotiates) the answer arrives while the body is still being sent: of a
+  # slowly sent 3000-byte body, most is never uploaded.
+  head -c 3000 /dev/zero > "$STATE/body.bin"
+  expect "a bad upload is refused through Traefik before its body is sent" "403 early" sh -c \
+    "curl -sk --http2 --max-time 20 --limit-rate 500 -X PUT --data-binary @$STATE/body.bin \
+       -H 'Authorization: Bearer $(printf 'ab%.0s' {1..32})' --resolve '$DOMAIN:$HTTPS_PORT:127.0.0.1' \
+       -o /dev/null -w '%{http_code} %{size_upload}' 'https://$DOMAIN:$HTTPS_PORT/v1/deploy' \
+     | awk '{ print \$1, (\$2 < 3000 ? \"early\" : \"late\") }'"
 
   echo "== client"
   tunnel_up
   expect "doctor accepts the key" "a signed GET /v1/services was accepted" client doctor
+  local evil
+  evil=$(project evil <<EOF
+# mypaas.service=evil
+# mypaas.url=https://$DOMAIN/v1
+FROM busybox:1.36
+CMD ["sleep", "3600"]
+EOF
+)
+  expect "a service cannot route the admin domain" "reserved for the mypaas API" client push "$evil"
+  evil=$(project evil-label <<'EOF'
+# mypaas.service=evil
+FROM busybox:1.36
+LABEL traefik.enable=true traefik.http.routers.x.rule="Host(`paas.vm.test`)"
+CMD ["sleep", "3600"]
+EOF
+)
+  expect "an image cannot bring its own Traefik labels" "only mypaas may set" client push "$evil"
   local web
   web=$(project web <<EOF
 # mypaas.service=web

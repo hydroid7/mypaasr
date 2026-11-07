@@ -179,9 +179,15 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
-/// The string that is signed for every small request.
-pub fn canonical_string(method: &str, path_and_query: &str, time: u64, nonce: &str, body: &[u8]) -> String {
-    format!("mypaas/v1\n{method}\n{path_and_query}\n{time}\n{nonce}\n{}", sha256_hex(body))
+/// The string that is signed for every small request. The host binds the
+/// signature to one server: a request signed for server B cannot be relayed
+/// to server A, even when both trust the same key.
+pub fn canonical_string(method: &str, host: &str, path_and_query: &str, time: u64, nonce: &str, body: &[u8]) -> String {
+    format!(
+        "mypaas/v1\n{}\n{method}\n{path_and_query}\n{time}\n{nonce}\n{}",
+        host.to_ascii_lowercase(),
+        sha256_hex(body)
+    )
 }
 
 pub fn sign(key: &SigningKey, canonical: &str) -> String {
@@ -316,11 +322,14 @@ pub(crate) mod tests {
     fn sign_and_verify() {
         let (sk, public) = test_key();
         let (vk, _, _) = parse_public_key(&public).unwrap();
-        let c = canonical_string("POST", "/v1/deploy-tickets", 1000, "00ff00ff00ff00ff", b"{}");
+        let c = canonical_string("POST", "a.example.com", "/v1/deploy-tickets", 1000, "00ff00ff00ff00ff", b"{}");
         let sig = sign(&sk, &c);
         assert!(verify(&vk, &c, &sig));
-        let other = canonical_string("POST", "/v1/deploy-tickets", 1000, "00ff00ff00ff00ff", b"{ }");
+        assert!(verify(&vk, &canonical_string("POST", "A.Example.com", "/v1/deploy-tickets", 1000, "00ff00ff00ff00ff", b"{}"), &sig));
+        let other = canonical_string("POST", "a.example.com", "/v1/deploy-tickets", 1000, "00ff00ff00ff00ff", b"{ }");
         assert!(!verify(&vk, &other, &sig));
+        let elsewhere = canonical_string("POST", "b.example.com", "/v1/deploy-tickets", 1000, "00ff00ff00ff00ff", b"{}");
+        assert!(!verify(&vk, &elsewhere, &sig), "a signature is valid for one server only");
         assert!(!verify(&vk, &c, "garbage"));
     }
 

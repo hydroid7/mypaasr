@@ -24,7 +24,9 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
 use super::deploy::{self, Caller};
-use super::guard::{Backoff, IpKey, IssueError, NonceResult, Nonces, RateLimiter, SIG_CHECKS_PER_SEC, TICKET_TTL, Ticket, Tickets};
+use super::guard::{
+    Backoff, InFlight, IpKey, IssueError, NonceResult, Nonces, RateLimiter, SIG_CHECKS_PER_SEC, TICKET_TTL, Ticket, Tickets,
+};
 use super::{DeployLock, Progress, api, clean_tmp, free_disk, stats};
 use crate::auth::{self, AuthorizedKey, Need, Scope};
 use crate::bundle::{UnpackLimits, unpack};
@@ -37,7 +39,6 @@ const MAX_CLOCK_SKEW: u64 = 30;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const SMALL_BODY_TIMEOUT: Duration = Duration::from_secs(10);
 const UPLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(15);
-const UPLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
 const KEYS_RELOAD: Duration = Duration::from_secs(5);
 const MIN_FREE_DISK: u64 = 1 << 30;
 
@@ -54,6 +55,7 @@ struct Guards {
     nonces: Nonces,
     tickets: Tickets,
     sig_limit: RateLimiter,
+    in_flight: InFlight,
 }
 
 pub struct State {
@@ -63,12 +65,16 @@ pub struct State {
     /// Serializes read-modify-write of the secrets files.
     secrets_lock: Mutex<()>,
     stats: Arc<Mutex<stats::StatsStore>>,
+    /// Longest an upload may take; Traefik's readTimeout cuts it off at the same point.
+    upload_timeout: Duration,
 }
 
 impl State {
     pub fn new(paths: Paths) -> State {
-        let retention = ServerConfig::load(&paths).map(|c| c.stats.retention_days).unwrap_or(90);
+        let cfg = ServerConfig::load(&paths).unwrap_or_default();
+        let retention = cfg.stats.retention_days;
         State {
+            upload_timeout: cfg.read_timeout(),
             stats: Arc::new(Mutex::new(stats::StatsStore::load(&paths, retention))),
             paths,
             keys: Mutex::new(KeyCache { keys: Vec::new(), checked: None, mtime: None }),
@@ -77,6 +83,7 @@ impl State {
                 nonces: Nonces::default(),
                 tickets: Tickets::default(),
                 sig_limit: RateLimiter::new(SIG_CHECKS_PER_SEC, Instant::now()),
+                in_flight: InFlight::default(),
             }),
             secrets_lock: Mutex::new(()),
         }
@@ -278,6 +285,9 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
     if let Some(wait) = state.guards().backoff.locked(ipk, Instant::now()) {
         return Ok(too_many(wait));
     }
+    let Some(_slot) = InFlightSlot::enter(&state, ipk) else {
+        return Ok(too_many(Duration::from_secs(1)));
+    };
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let (resp, outcome) = handle_inner(&state, ipk, req).await;
@@ -290,6 +300,24 @@ async fn handle(state: Arc<State>, peer: SocketAddr, req: Request<Incoming>) -> 
         Outcome::Other => tracing::info!(%ip, %method, %path, status = resp.status().as_u16(), "rejected"),
     }
     Ok(resp)
+}
+
+/// Holds one of the address's in-flight slots until the request is handled.
+struct InFlightSlot<'a> {
+    state: &'a State,
+    ip: IpKey,
+}
+
+impl<'a> InFlightSlot<'a> {
+    fn enter(state: &'a State, ip: IpKey) -> Option<Self> {
+        state.guards().in_flight.try_enter(ip).then_some(InFlightSlot { state, ip })
+    }
+}
+
+impl Drop for InFlightSlot<'_> {
+    fn drop(&mut self) {
+        self.state.guards().in_flight.leave(self.ip);
+    }
 }
 
 enum Outcome {
@@ -413,7 +441,10 @@ async fn verify_signed(state: &Arc<State>, req: Request<Incoming>, length: u64) 
         return Err(Reject::Response(error(StatusCode::BAD_REQUEST, "body does not match Content-Length")));
     }
     let path_and_query = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    let canonical = auth::canonical_string(parts.method.as_str(), path_and_query, time, nonce, &body);
+    // Traefik routes only `Host(<admin domain>)` here, so a request signed for
+    // another server carries a different host in its signature.
+    let Some(host) = header_str(h, "host") else { return Err(Reject::Denied("missing host")) };
+    let canonical = auth::canonical_string(parts.method.as_str(), host, path_and_query, time, nonce, &body);
     if !auth::verify(&key.key, &canonical, sig) {
         return Err(Reject::Denied("bad signature"));
     }
@@ -513,7 +544,7 @@ async fn upload(state: &Arc<State>, ipk: IpKey, req: Request<Incoming>, length: 
 
     let id = format!("{}-{:08x}", auth::unix_now(), rand::random::<u32>());
     let bundle = state.paths.tmp().join(format!("upload-{id}.tar.zst"));
-    if let Err(resp) = receive(req.into_body(), &bundle, &ticket).await {
+    if let Err(resp) = receive(req.into_body(), &bundle, &ticket, state.upload_timeout).await {
         let _ = std::fs::remove_file(&bundle);
         return (resp, Outcome::Ok(key_name));
     }
@@ -547,7 +578,7 @@ fn finish(tx: &Progress, what: &str, result: Result<()>) {
 
 /// Streams the body to `path`, counting and hashing. Stops as soon as the count
 /// exceeds the ticket's size, or the hash does not match at the end.
-async fn receive(mut body: Incoming, path: &std::path::Path, ticket: &Ticket) -> Result<(), Response<Body>> {
+async fn receive(mut body: Incoming, path: &std::path::Path, ticket: &Ticket, total: Duration) -> Result<(), Response<Body>> {
     let internal = |e: std::io::Error| {
         tracing::error!("upload: {e}");
         error(StatusCode::INTERNAL_SERVER_ERROR, "cannot store upload")
@@ -559,7 +590,7 @@ async fn receive(mut body: Incoming, path: &std::path::Path, ticket: &Ticket) ->
     };
     let mut hasher = Sha256::new();
     let mut count = 0u64;
-    let deadline = tokio::time::Instant::now() + UPLOAD_TOTAL_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + total;
     loop {
         let next = tokio::time::timeout_at(deadline.min(tokio::time::Instant::now() + UPLOAD_STALL_TIMEOUT), body.frame()).await;
         let frame = match next {
@@ -775,7 +806,7 @@ mod tests {
         time: u64,
     ) -> Vec<u8> {
         let nonce = hex::encode(rand::random::<[u8; 16]>());
-        let sig = auth::sign(key, &auth::canonical_string(method, path, time, &nonce, body.as_bytes()));
+        let sig = auth::sign(key, &auth::canonical_string(method, "x", path, time, &nonce, body.as_bytes()));
         format!(
             "{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nX-Forwarded-For: {xff}\r\n\
              X-Mypaas-Key: {key_id}\r\nX-Mypaas-Time: {time}\r\nX-Mypaas-Nonce: {nonce}\r\nX-Mypaas-Sig: {sig}\r\n\
@@ -867,6 +898,29 @@ mod tests {
         let (sk, id) = srv.add_key("secrets:x", None);
         let ok = signed_as(&sk, &id, "GET", "/v1/services/x/secrets", "", "10.0.0.9", now + 25);
         assert_eq!(raw(srv.addr, &ok).await.0, 200);
+    }
+
+    /// A request signed for one server cannot be relayed to another that trusts
+    /// the same key: the host is part of the signature.
+    #[tokio::test]
+    async fn signatures_are_bound_to_the_host() {
+        let srv = start("read").await;
+        let time = auth::unix_now();
+        let request = |signed_for: &str, sent_to: &str, ip: &str| {
+            let nonce = hex::encode(rand::random::<[u8; 16]>());
+            let sig = auth::sign(&srv.signing, &auth::canonical_string("GET", signed_for, "/v1/services", time, &nonce, b""));
+            format!(
+                "GET /v1/services HTTP/1.1\r\nHost: {sent_to}\r\nConnection: close\r\nX-Forwarded-For: {ip}\r\n\
+                 X-Mypaas-Key: {}\r\nX-Mypaas-Time: {time}\r\nX-Mypaas-Nonce: {nonce}\r\nX-Mypaas-Sig: {sig}\r\n\r\n",
+                srv.key_id
+            )
+            .into_bytes()
+        };
+        assert_eq!(raw(srv.addr, &request("paas.example.com", "paas.example.com", "8.0.0.1")).await.0, 200);
+        assert_eq!(raw(srv.addr, &request("paas.example.com", "PAAS.example.com", "8.0.0.1")).await.0, 200, "case does not matter");
+        let (status, text) = raw(srv.addr, &request("other.example.org", "paas.example.com", "8.0.0.2")).await;
+        assert_eq!(status, 403, "{text}");
+        assert_eq!(json_body(&text)["error"], "denied");
     }
 
     #[tokio::test]

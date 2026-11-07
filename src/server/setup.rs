@@ -7,10 +7,11 @@ use anyhow::{Context, Result, bail};
 
 use crate::auth::{self, AuthorizedKey, Scope};
 use super::{sockproxy, stats};
-use crate::config::{Paths, ROUTER_CONTAINER, ServerConfig, TRAEFIK_VERSION, write_atomic};
+use crate::config::{Paths, ROUTER_CONTAINER, ServerConfig, traefik_image, write_atomic};
 
 pub const SYSTEMD_UNIT: &str = "/etc/systemd/system/mypaasd.service";
 pub const PROXY_UNIT: &str = "/etc/systemd/system/mypaas-socket-proxy.service";
+pub const FIREWALL_UNIT: &str = "/etc/systemd/system/mypaas-firewall.service";
 /// Where Traefik sees the proxy's socket directory.
 const PROXY_MOUNT: &str = "/mypaas-run";
 
@@ -139,12 +140,28 @@ level = "WARN"
 [entryPoints.web]
 address = ":80"
 
+[entryPoints.web.transport.respondingTimeouts]
+readTimeout = "60s"
+idleTimeout = "60s"
+
+[entryPoints.web.http]
+maxHeaderBytes = 32768
+
 [entryPoints.web-secure]
 address = ":443"
 
-# Uploads may take a few minutes; the daemon enforces its own limits.
+# Traefik has no separate header timeout, so readTimeout also limits how long
+# a client may trickle headers. It must fit the largest upload; see
+# router.read_timeout in config.toml.
 [entryPoints.web-secure.transport.respondingTimeouts]
-readTimeout = "600s"
+readTimeout = "{read_timeout}"
+idleTimeout = "60s"
+
+[entryPoints.web-secure.http]
+maxHeaderBytes = 32768
+
+[entryPoints.web-secure.http2]
+maxConcurrentStreams = 100
 
 [providers.docker]
 {endpoint}exposedByDefault = false
@@ -160,13 +177,38 @@ keyType = "EC256"
 
 [certificatesResolvers.default.acme.httpChallenge]
 entryPoint = "web"
-{access_log}"#
+{access_log}"#,
+        read_timeout = cfg.router.read_timeout,
     )
 }
+
+/// TLS 1.2 suites with forward secrecy and AEAD only; TLS 1.3 suites are not configurable.
+const CIPHERS: &str = r#"[
+  "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+  "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+  "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+  "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+  "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305",
+  "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305",
+]"#;
 
 pub fn staticroutes_toml(cfg: &ServerConfig) -> String {
     let domain = &cfg.domain;
     let port = cfg.listen.rsplit(':').next().unwrap_or("88");
+    // Validated as addresses or CIDRs when the config is loaded.
+    let (allow_mw, allow_def) = if cfg.router.api_allow.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let ranges: Vec<String> = cfg.router.api_allow.iter().map(|r| format!("\"{r}\"")).collect();
+        (
+            "\"mypaas-api-allow\", ".to_string(),
+            format!(
+                "# Only these networks reach the API (router.api_allow in config.toml).\n\
+                 [http.middlewares.mypaas-api-allow.ipAllowList]\nsourceRange = [{}]\n\n",
+                ranges.join(", ")
+            ),
+        )
+    };
     format!(
         r#"# Written by mypaas server init; changes are overwritten.
 
@@ -176,7 +218,10 @@ pub fn staticroutes_toml(cfg: &ServerConfig) -> String {
 rule = "Host(`{domain}`) && Path(`/v1/deploy`)"
 entryPoints = ["web-secure"]
 service = "mypaas-daemon"
-priority = 200
+middlewares = [{allow_mw}"mypaas-api-limit", "mypaas-api-inflight"]
+# Above any rule a service can produce (its default priority is the rule's
+# length, and service URLs are bounded and may not use this domain anyway).
+priority = 100001
 [http.routers.mypaas-upload.tls]
 certResolver = "default"
 options = "intermediate"
@@ -185,7 +230,8 @@ options = "intermediate"
 rule = "Host(`{domain}`) && PathPrefix(`/v1/`)"
 entryPoints = ["web-secure"]
 service = "mypaas-daemon"
-priority = 100
+middlewares = [{allow_mw}"mypaas-api-limit", "mypaas-api-inflight"]
+priority = 100000
 [http.routers.mypaas-api.tls]
 certResolver = "default"
 options = "intermediate"
@@ -195,10 +241,21 @@ rule = "Host(`{domain}`)"
 entryPoints = ["web"]
 middlewares = ["https-redirect"]
 service = "mypaas-daemon"
+priority = 100000
 
 [http.services.mypaas-daemon.loadBalancer]
 [[http.services.mypaas-daemon.loadBalancer.servers]]
 url = "http://127.0.0.1:{port}"
+
+{allow_def}# Per client address, in front of the daemon's own backoff. Neither buffers
+# the body. Behind a CDN, both need a sourceCriterion for its header.
+[http.middlewares.mypaas-api-limit.rateLimit]
+average = 10
+period = "1s"
+burst = 50
+
+[http.middlewares.mypaas-api-inflight.inFlightReq]
+amount = 16
 
 [http.middlewares.https-redirect.redirectScheme]
 scheme = "https"
@@ -209,17 +266,20 @@ stsSeconds = 63072000
 stsIncludeSubdomains = true
 stsPreload = true
 
+# Used for every connection whose name no router claims. sniStrict refuses
+# the handshake instead of serving Traefik's default certificate, so scanners
+# that connect by IP learn nothing.
+[tls.options.default]
+minVersion = "VersionTLS12"
+sniStrict = {strict}
+cipherSuites = {CIPHERS}
+
 [tls.options.intermediate]
 minVersion = "VersionTLS12"
-cipherSuites = [
-  "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-  "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-  "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-  "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-  "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305",
-  "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305",
-]
-"#
+sniStrict = {strict}
+cipherSuites = {CIPHERS}
+"#,
+        strict = cfg.router.strict_sni,
     )
 }
 
@@ -301,11 +361,45 @@ WantedBy=multi-user.target
     )
 }
 
+/// Keeps containers, and builds, away from link-local addresses. On AWS, GCP
+/// and Azure the instance metadata service at 169.254.169.254 hands out the
+/// VM's cloud credentials to anyone who asks, so an SSRF bug in any hosted
+/// app would become a cloud account compromise. Docker's DOCKER-USER chain sees
+/// all traffic leaving container networks; the rule is put back whenever
+/// Docker restarts.
+pub fn firewall_unit() -> String {
+    let rule4 = "DOCKER-USER -d 169.254.0.0/16 -j REJECT --reject-with icmp-port-unreachable";
+    let rule6 = "DOCKER-USER -d fd00:ec2::254/128 -j REJECT";
+    format!(
+        r#"[Unit]
+Description=mypaas: block containers from the cloud metadata service
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'iptables -C {rule4} 2>/dev/null || iptables -I {rule4}'
+ExecStart=-/bin/sh -c 'ip6tables -C {rule6} 2>/dev/null || ip6tables -I {rule6}'
+ExecStop=-/bin/sh -c 'iptables -D {rule4}; ip6tables -D {rule6}'
+
+[Install]
+WantedBy=docker.service
+"#
+    )
+}
+
 fn write_systemd_units(paths: &Paths, cfg: &ServerConfig) -> Result<()> {
     let exe = std::env::current_exe()?;
     write_atomic(Path::new(SYSTEMD_UNIT), systemd_unit(paths, &exe).as_bytes(), 0o644)?;
     write_atomic(Path::new(PROXY_UNIT), proxy_unit(paths, &exe).as_bytes(), 0o644)?;
+    write_atomic(Path::new(FIREWALL_UNIT), firewall_unit().as_bytes(), 0o644)?;
     run("systemctl", &["daemon-reload"])?;
+    if let Err(e) = run("systemctl", &["enable", "--now", "mypaas-firewall"]) {
+        // For example Docker with its nftables backend, which has no DOCKER-USER chain.
+        eprintln!("warning: could not block the cloud metadata service for containers: {e:#}");
+    }
     run("systemctl", &["enable", "mypaasd"])?;
     if cfg.router.socket_proxy {
         run("systemctl", &["enable", "mypaas-socket-proxy"])?;
@@ -348,7 +442,7 @@ fn restart_router(paths: &Paths) -> Result<()> {
         run("systemctl", &["restart", "mypaas-socket-proxy"])?;
         println!("restarted mypaas-socket-proxy");
     }
-    let image = format!("traefik:v{TRAEFIK_VERSION}");
+    let image = traefik_image();
     run("docker", &["pull", &image])?;
     let _ = Command::new("docker").args(["rm", "-f", ROUTER_CONTAINER]).output();
     let mount = |src: &Path, dst: &str, ro: bool| {
@@ -363,38 +457,43 @@ fn restart_router(paths: &Paths) -> Result<()> {
     };
     // Host networking lets Traefik reach the daemon on loopback and every
     // service's bridge network; it binds ports 80 and 443 itself.
-    run(
-        "docker",
-        &[
-            "run",
-            "--detach",
-            "--name",
-            ROUTER_CONTAINER,
-            "--restart",
-            "always",
-            "--network",
-            "host",
-            "--log-opt",
-            "max-size=10m",
-            "--log-opt",
-            "max-file=3",
-            "--mount",
-            &mount(&paths.traefik_toml(), "/traefik.toml", true),
-            "--mount",
-            &mount(&paths.staticroutes_toml(), "/staticroutes.toml", true),
-            "--mount",
-            &mount(&paths.acme_json(), "/acme.json", false),
-            "--mount",
-            &docker_mount,
-            "--mount",
-            &mount(&stats::log_dir(paths), stats::LOG_MOUNT, false),
-            &image,
-            "--configFile=/traefik.toml",
-        ],
-    )?;
+    let mut args: Vec<&str> = vec!["run", "--detach", "--name", ROUTER_CONTAINER, "--restart", "always", "--network", "host"];
+    args.extend_from_slice(ROUTER_HARDENING);
+    let (config, routes, acme, logs) = (
+        mount(&paths.traefik_toml(), "/traefik.toml", true),
+        mount(&paths.staticroutes_toml(), "/staticroutes.toml", true),
+        mount(&paths.acme_json(), "/acme.json", false),
+        mount(&stats::log_dir(paths), stats::LOG_MOUNT, false),
+    );
+    args.extend_from_slice(&[
+        "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
+        "--mount", &config, "--mount", &routes, "--mount", &acme, "--mount", &docker_mount, "--mount", &logs,
+        &image, "--configFile=/traefik.toml",
+    ]);
+    run("docker", &args)?;
     println!("started {ROUTER_CONTAINER} ({image})");
     Ok(())
 }
+
+/// How Traefik runs. It is the only process on a public port, so it gets as
+/// little as possible: no capabilities except binding ports 80 and 443, no
+/// privilege escalation, a read-only image, and memory and process limits.
+/// `tests/docker.rs` starts its Traefik with the same flags.
+pub const ROUTER_HARDENING: &[&str] = &[
+    "--cap-drop",
+    "ALL",
+    "--cap-add",
+    "NET_BIND_SERVICE",
+    "--security-opt",
+    "no-new-privileges",
+    "--read-only",
+    "--tmpfs",
+    "/tmp:rw,nosuid,nodev,noexec,size=16m",
+    "--memory",
+    "512m",
+    "--pids-limit",
+    "512",
+];
 
 pub fn add_key(paths: &Paths, public: &str, name: &str, scopes: &[Scope], expires: Option<u64>) -> Result<AuthorizedKey> {
     if !auth::is_valid_key_name(name) {
@@ -524,12 +623,47 @@ mod tests {
         assert_eq!(t["providers"]["docker"]["endpoint"].as_str(), Some("unix:///mypaas-run/docker.sock"));
         assert_eq!(t["accessLog"]["fields"]["defaultMode"].as_str(), Some("drop"), "privacy: drop by default");
         assert_eq!(t["accessLog"]["fields"]["names"].as_table().unwrap().len(), 4);
+        // Internet-facing limits.
+        let ws = &t["entryPoints"]["web-secure"];
+        assert_eq!(ws["transport"]["respondingTimeouts"]["readTimeout"].as_str(), Some("300s"));
+        assert_eq!(ws["http"]["maxHeaderBytes"].as_integer(), Some(32768));
+        assert_eq!(t["entryPoints"]["web"]["transport"]["respondingTimeouts"]["readTimeout"].as_str(), Some("60s"));
+        let routers = &s["http"]["routers"];
+        for r in ["mypaas-upload", "mypaas-api"] {
+            let mw: Vec<&str> = routers[r]["middlewares"].as_array().unwrap().iter().map(|m| m.as_str().unwrap()).collect();
+            assert_eq!(mw, ["mypaas-api-limit", "mypaas-api-inflight"], "{r}");
+            assert!(routers[r]["priority"].as_integer().unwrap() >= 100_000, "{r} outranks any service rule");
+        }
+        assert!(s["http"]["middlewares"]["mypaas-api-limit"]["rateLimit"]["average"].is_integer());
+        assert_eq!(s["tls"]["options"]["default"]["sniStrict"].as_bool(), Some(true));
+        assert_eq!(s["tls"]["options"]["default"]["minVersion"].as_str(), Some("VersionTLS12"));
+        assert_eq!(s["tls"]["options"]["intermediate"]["cipherSuites"].as_array().unwrap().len(), 6);
+        assert!(s["http"]["middlewares"].get("mypaas-api-allow").is_none(), "no allowlist unless configured");
+        let mut only = cfg.clone();
+        only.router.api_allow = vec!["203.0.113.0/24".into(), "2001:db8::/32".into()];
+        let s: toml::Value = toml::from_str(&staticroutes_toml(&only)).unwrap();
+        let ranges = s["http"]["middlewares"]["mypaas-api-allow"]["ipAllowList"]["sourceRange"].as_array().unwrap();
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(s["http"]["routers"]["mypaas-upload"]["middlewares"][0].as_str(), Some("mypaas-api-allow"), "checked first");
+        let mut lax = cfg.clone();
+        lax.router.strict_sni = false;
+        let s: toml::Value = toml::from_str(&staticroutes_toml(&lax)).unwrap();
+        assert_eq!(s["tls"]["options"]["default"]["sniStrict"].as_bool(), Some(false));
+
         let mut raw = cfg.clone();
         raw.router.socket_proxy = false;
         raw.stats.enabled = false;
         let t: toml::Value = toml::from_str(&traefik_toml(&raw)).unwrap();
         assert!(t["providers"]["docker"].get("endpoint").is_none());
         assert!(t.get("accessLog").is_none());
+    }
+
+    #[test]
+    fn firewall_unit_blocks_metadata_idempotently() {
+        let u = firewall_unit();
+        assert!(u.contains("-C DOCKER-USER -d 169.254.0.0/16"), "checks before inserting, so restarts add no duplicates");
+        assert!(u.contains("-I DOCKER-USER -d 169.254.0.0/16"));
+        assert!(u.contains("PartOf=docker.service"), "re-applied when Docker restarts");
     }
 
     #[test]

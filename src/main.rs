@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use client::Output;
-use config::{Paths, TRAEFIK_VERSION};
+use config::{Paths, TRAEFIK_VERSION, TRAEFIK_DIGEST};
 
 #[derive(Parser)]
 #[command(name = "mypaas", version, about = "Deploy Dockerfiles to your own server over one small HTTPS API")]
@@ -268,7 +268,7 @@ async fn run_server(cmd: ServerCmd) -> Result<()> {
             };
             let email = match email {
                 Some(e) => e,
-                None => prompt("Let's Encrypt email (optional): ")?,
+                None => prompt("Let's Encrypt account email (optional, Enter to skip): ")?,
             };
             server::setup::init(&paths, &domain, &email, key.as_deref())
         }
@@ -315,7 +315,7 @@ async fn run_server(cmd: ServerCmd) -> Result<()> {
             server::sockproxy::run(&paths, std::path::Path::new(server::sockproxy::UPSTREAM)).await
         }
         ServerCmd::Version => {
-            println!("mypaas {} (traefik {TRAEFIK_VERSION})", env!("CARGO_PKG_VERSION"));
+            println!("mypaas {} (traefik {TRAEFIK_VERSION}, {TRAEFIK_DIGEST})", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
     }

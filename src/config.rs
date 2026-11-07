@@ -7,9 +7,16 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::spec::{is_valid_host, is_valid_name, parse_size};
+use crate::spec::{is_valid_host, parse_size};
 
-pub const TRAEFIK_VERSION: &str = "3.6.1";
+pub const TRAEFIK_VERSION: &str = "3.7.17";
+/// Digest of the multi-arch image for TRAEFIK_VERSION, so a re-pushed tag
+/// cannot change what runs on the internet-facing port. Update both together.
+pub const TRAEFIK_DIGEST: &str = "sha256:f4bb143d1135a579b630ed491e17ec50f6f7c9c6a30585ff3d385471d2a86f5a";
+
+pub fn traefik_image() -> String {
+    format!("traefik:v{TRAEFIK_VERSION}@{TRAEFIK_DIGEST}")
+}
 pub const ROUTER_CONTAINER: &str = "mypaas-router";
 
 #[derive(Debug, Clone)]
@@ -76,7 +83,6 @@ pub struct ServerConfig {
     pub limits: Limits,
     pub defaults: Defaults,
     pub maximums: Maximums,
-    pub networks: BTreeMap<String, SharedNetwork>,
     pub volumes: VolumeConfig,
     pub router: RouterConfig,
     pub stats: StatsConfig,
@@ -109,13 +115,6 @@ pub struct Maximums {
     pub mem: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct SharedNetwork {
-    /// Service name patterns that may join, e.g. `shop-*`.
-    pub members: Vec<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VolumeConfig {
@@ -137,6 +136,16 @@ pub struct RouterConfig {
     /// Traefik reaches Docker through mypaas' read-only socket proxy instead of
     /// the raw socket, so the internet-facing process is not root-equivalent.
     pub socket_proxy: bool,
+    /// How long one request on port 443 may take to arrive, headers and body.
+    /// Traefik has no separate header timeout, so this also bounds slow-header
+    /// attacks; it must fit the largest upload at the slowest uplink.
+    pub read_timeout: String,
+    /// Refuse TLS handshakes for names without a certificate instead of serving
+    /// Traefik's default one. Turn off only for testing without real certificates.
+    pub strict_sni: bool,
+    /// If not empty, only these client networks (CIDRs) reach the admin API;
+    /// everyone else gets 403 from Traefik. The services are not affected.
+    pub api_allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,7 +165,7 @@ impl Default for StatsConfig {
 
 impl Default for RouterConfig {
     fn default() -> Self {
-        RouterConfig { socket_proxy: true }
+        RouterConfig { socket_proxy: true, read_timeout: "300s".into(), strict_sni: true, api_allow: Vec::new() }
     }
 }
 
@@ -169,7 +178,6 @@ impl Default for ServerConfig {
             limits: Limits::default(),
             defaults: Defaults::default(),
             maximums: Maximums::default(),
-            networks: BTreeMap::new(),
             volumes: VolumeConfig::default(),
             router: RouterConfig::default(),
             stats: StatsConfig::default(),
@@ -180,9 +188,9 @@ impl Default for ServerConfig {
 impl Default for Limits {
     fn default() -> Self {
         Limits {
-            max_upload: "50m".into(),
+            max_upload: "100m".into(),
             max_unpacked: "200m".into(),
-            max_files: 20_000,
+            max_files: 40_000,
             max_depth: 32,
             build_timeout: "15m".into(),
         }
@@ -229,19 +237,18 @@ impl ServerConfig {
         if !self.domain.is_empty() && !is_valid_host(&self.domain) {
             bail!("domain {:?} is not a valid host name", self.domain);
         }
-        if self.email.contains(['"', '\\', '\n']) {
-            bail!("invalid email");
+        if !self.email.is_empty() && !is_plausible_email(&self.email) {
+            bail!("email {:?} does not look like an email address", self.email);
         }
         self.limits()?;
-        for (name, net) in &self.networks {
-            if !is_valid_name(name) {
-                bail!("invalid network name {name:?}");
+        for net in &self.router.api_allow {
+            if !is_cidr(net) {
+                bail!("router.api_allow entry {net:?} is not an address or CIDR like 203.0.113.0/24");
             }
-            for m in &net.members {
-                if m.is_empty() || !m.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"-_*?".contains(&c)) {
-                    bail!("network {name}: invalid member pattern {m:?}");
-                }
-            }
+        }
+        let rt = crate::spec::parse_duration_ms(&self.router.read_timeout).context("router.read_timeout")?;
+        if !(60_000..=3_600_000).contains(&rt) {
+            bail!("router.read_timeout must be between 60s and 1h");
         }
         if !(1..=3650).contains(&self.stats.retention_days) {
             bail!("stats.retention_days must be between 1 and 3650");
@@ -250,6 +257,12 @@ impl ServerConfig {
             check_allowlist_entry(paths, entry)?;
         }
         Ok(())
+    }
+
+    /// `router.read_timeout`, validated at load.
+    pub fn read_timeout(&self) -> std::time::Duration {
+        let ms = crate::spec::parse_duration_ms(&self.router.read_timeout).unwrap_or(300_000);
+        std::time::Duration::from_millis(ms)
     }
 
     pub fn limits(&self) -> Result<EffectiveLimits> {
@@ -270,11 +283,27 @@ impl ServerConfig {
         Ok(l)
     }
 
-    pub fn network_allows(&self, network: &str, service: &str) -> bool {
-        self.networks
-            .get(network)
-            .is_some_and(|n| n.members.iter().any(|m| glob_match::glob_match(m, service)))
-    }
+}
+
+/// `203.0.113.7`, `203.0.113.0/24` or `2001:db8::/32`.
+pub fn is_cidr(s: &str) -> bool {
+    let (addr, prefix) = match s.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (s, None),
+    };
+    let Ok(ip) = addr.parse::<std::net::IpAddr>() else { return false };
+    let max = if ip.is_ipv4() { 32 } else { 128 };
+    prefix.is_none_or(|p| p.parse::<u8>().is_ok_and(|n| n <= max) && !p.starts_with('+'))
+}
+
+/// `local@domain.tld`, printable, and nothing that could break out of the TOML string
+/// it is written into.
+fn is_plausible_email(s: &str) -> bool {
+    let Some((local, domain)) = s.split_once('@') else { return false };
+    !local.is_empty()
+        && domain.contains('.')
+        && is_valid_host(&domain.to_ascii_lowercase())
+        && s.bytes().all(|c| c.is_ascii_graphic() && c != b'"' && c != b'\\')
 }
 
 /// Lexically normalizes an absolute path: resolves `.` and `..` without touching
@@ -425,6 +454,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cidrs() {
+        for ok in ["203.0.113.7", "203.0.113.0/24", "2001:db8::/32", "::1"] {
+            assert!(is_cidr(ok), "{ok}");
+        }
+        for bad in ["203.0.113.0/33", "2001:db8::/129", "example.com", "1.2.3.4/", "1.2.3.4/x", "\"]"] {
+            assert!(!is_cidr(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn emails() {
+        assert!(is_plausible_email("ops@example.com"));
+        assert!(is_plausible_email("a.b+paas@Mail.Example.org"));
+        assert!(!is_plausible_email("example.com"));
+        assert!(!is_plausible_email("a@localhost"));
+        assert!(!is_plausible_email("a@b.com\"\nx"));
+        assert!(!is_plausible_email("a b@c.com"));
+    }
+
+    #[test]
     fn normalize_paths() {
         assert_eq!(normalize(Path::new("/a/./b/../c")).unwrap(), PathBuf::from("/a/c"));
         assert!(normalize(Path::new("/..")).is_none());
@@ -485,11 +534,6 @@ mod tests {
         let text = toml::to_string(&cfg).unwrap();
         let back: ServerConfig = toml::from_str(&text).unwrap();
         back.limits().unwrap();
-        let mut cfg = back;
-        cfg.networks.insert("db".into(), SharedNetwork { members: vec!["shop-*".into(), "blog".into()] });
-        assert!(cfg.network_allows("db", "shop-web"));
-        assert!(!cfg.network_allows("db", "evil"));
-        assert!(!cfg.network_allows("cache", "blog"));
     }
 }
 

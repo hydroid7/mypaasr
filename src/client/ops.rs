@@ -131,7 +131,6 @@ pub async fn status(remote: Option<&str>, service: &str, out: Output) -> Result<
         },
     );
     row("networks", strs("networks"));
-    row("publish", strs("publish"));
     row("env", strs("env"));
     let volumes: Vec<String> = v["volumes"]
         .as_array()
@@ -552,10 +551,15 @@ async fn doctor_checks(remote: Option<&str>, checks: &mut Vec<Check>, code: &mut
         Some(server) => {
             let server = server.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
             let skew = auth::unix_now() as i64 - server as i64;
-            if skew.abs() <= 10 {
-                checks.push(Check { name: "clock", ok: true, detail: format!("{skew:+}s from the server") });
-            } else {
-                fail(checks, "clock", format!("{skew:+}s from the server; requests are accepted within 30s"), EXIT_ERROR);
+            // The server accepts 30s; fail with a margin for network delay.
+            match skew.abs() {
+                0..=10 => checks.push(Check { name: "clock", ok: true, detail: format!("{skew:+}s from the server") }),
+                11..=25 => checks.push(Check {
+                    name: "clock",
+                    ok: true,
+                    detail: format!("{skew:+}s from the server; close to the 30s limit, check NTP"),
+                }),
+                _ => fail(checks, "clock", format!("{skew:+}s from the server; requests are accepted within 30s"), EXIT_ERROR),
             }
         }
         None => fail(checks, "clock", "the server sent no Date header".into(), EXIT_ERROR),

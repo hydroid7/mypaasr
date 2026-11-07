@@ -106,6 +106,19 @@ pub async fn deploy_dir(
         dir.to_string_lossy().into_owned(),
     ]);
     docker_stream(&args, progress, Duration::from_millis(limits.build_timeout_ms)).await?;
+    // Checked and read now, before any container exists from this image, so
+    // nothing can fail between swapping containers and recording the deploy.
+    let checked = async {
+        check_image_labels(&spec.service, &image_labels(&image).await?)?;
+        image_id(&image).await
+    };
+    let new_image_id = match checked.await {
+        Ok(id) => id,
+        Err(e) => {
+            docker_quiet(&["rmi", &image]).await;
+            return Err(e);
+        }
+    };
 
     let result = async {
         prepare_ownership(paths, &cfg, &spec, &image, progress).await?;
@@ -120,7 +133,7 @@ pub async fn deploy_dir(
     let record = DeployRecord {
         spec: spec.clone(),
         deploy_id: deploy_id.clone(),
-        image_id: image_id(&image).await?,
+        image_id: new_image_id,
         time: unix_now(),
         key_name: caller.key_name.clone(),
     };
@@ -157,6 +170,36 @@ pub async fn rollback(paths: &Paths, service: &str, caller: &Caller, progress: &
     Ok(())
 }
 
+async fn image_labels(image: &str) -> Result<std::collections::BTreeMap<String, String>> {
+    let out = docker(&["image", "inspect", "--format", "{{json .Config.Labels}}", image]).await?;
+    let v: Option<std::collections::BTreeMap<String, String>> =
+        serde_json::from_str(out.trim()).context("cannot read the image labels")?;
+    Ok(v.unwrap_or_default())
+}
+
+/// Docker copies image labels onto every container, and Traefik routes by
+/// container labels. A `LABEL traefik.…` in a Dockerfile would therefore let a
+/// deploy key route any domain, the admin API's included, to its container.
+/// Only mypaas sets these labels; an image that carries any is refused.
+pub fn check_image_labels(service: &str, labels: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    let reserved: Vec<&str> = labels
+        .iter()
+        .filter(|(k, v)| {
+            let k = k.to_ascii_lowercase();
+            // The build itself adds mypaas.service=<service>.
+            (k.starts_with("traefik.") || k.starts_with("mypaas.")) && !(k == "mypaas.service" && *v == service)
+        })
+        .map(|(k, _)| k.as_str())
+        .collect();
+    if !reserved.is_empty() {
+        bail!(
+            "the image sets labels that only mypaas may set: {}; remove these LABEL lines (also from base images)",
+            reserved.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// Warns about root images and hands empty named volumes to the image's user.
 async fn prepare_ownership(paths: &Paths, cfg: &ServerConfig, spec: &ServiceSpec, image: &str, progress: &Progress) -> Result<()> {
     let user = owner::image_user(image).await?;
@@ -185,14 +228,6 @@ fn prepare(
     let privileged = spec.privileged_features();
     if !privileged.is_empty() && !caller.admin {
         bail!("these settings need the admin scope: {}", privileged.join(", "));
-    }
-    for net in &spec.networks {
-        if !cfg.networks.contains_key(net) {
-            bail!("network {net:?} is not declared in the server's config.toml");
-        }
-        if !cfg.network_allows(net, &spec.service) {
-            bail!("service {} is not a member of network {net:?}", spec.service);
-        }
     }
     let cpu = spec.maxcpu.unwrap_or(limits.default_cpu);
     if cpu > limits.max_cpu {
@@ -239,6 +274,11 @@ fn prepare(
         env_lines.push(format!("{}={value}", e.key));
     }
 
+    // The admin domain belongs to the daemon; a service route there could
+    // intercept API requests, tickets and secret values.
+    if let Some(u) = spec.urls.iter().find(|u| !cfg.domain.is_empty() && u.host == cfg.domain) {
+        bail!("url {} is on the admin domain, which is reserved for the mypaas API", u.to_url());
+    }
     check_url_conflicts(paths, spec)?;
 
     Ok(Prepared {
@@ -386,14 +426,6 @@ impl Run<'_> {
         if spec.readonly {
             args.extend(["--read-only".into(), "--tmpfs".into(), "/tmp:rw,nosuid,nodev".into()]);
         }
-        for pb in &spec.publish {
-            let bind = match pb.bind {
-                std::net::IpAddr::V6(v6) => format!("[{v6}]"),
-                v4 => v4.to_string(),
-            };
-            let proto = if pb.udp { "udp" } else { "tcp" };
-            args.extend(["--publish".into(), format!("{bind}:{}:{}/{proto}", pb.host_port, pb.container_port)]);
-        }
         for m in &p.mounts {
             args.extend(["--mount".into(), m.clone()]);
         }
@@ -493,6 +525,14 @@ async fn replace_containers(
         ensure_network(&shared_network(net), &format!("mypaas.network={net}")).await?;
     }
 
+    warn_shared_volumes(spec, progress);
+
+    // Everything that can fail without touching the running containers comes first.
+    let env_file = TempFile(paths.tmp().join(format!("env-{deploy_id}")));
+    let mut content = prepared.env_lines.join("\n");
+    content.push('\n');
+    write_atomic(&env_file.0, content.as_bytes(), 0o600)?;
+
     let existing = list_containers(Some(&spec.service)).await?;
     for stale in existing.iter().filter(|c| c.name.contains(".old.")) {
         say(progress, format!("removing stale container {}", stale.name));
@@ -504,15 +544,16 @@ async fn replace_containers(
     let mut olds: Vec<(String, String, bool)> = Vec::new(); // (original, renamed, was running)
     for (n, name) in current.iter().enumerate() {
         let renamed = format!("{name}.old.{stamp}.{n}");
-        docker(&["rename", name, &renamed]).await?;
+        if let Err(e) = docker(&["rename", name, &renamed]).await {
+            // Put back the ones already renamed; they were never stopped.
+            for (original, renamed, _) in &olds {
+                docker_quiet(&["rename", renamed, original]).await;
+            }
+            return Err(e);
+        }
         let running = existing.iter().any(|c| c.name == *name && c.running);
         olds.push((name.to_string(), renamed, running));
     }
-
-    let env_file = TempFile(paths.tmp().join(format!("env-{deploy_id}")));
-    let mut content = prepared.env_lines.join("\n");
-    content.push('\n');
-    write_atomic(&env_file.0, content.as_bytes(), 0o600)?;
 
     let mut run = Run { spec, prepared, image, deploy_id, env_file: env_file.0.clone(), progress, created: Vec::new() };
     let result = run_strategy(&mut run, &olds).await;
@@ -539,6 +580,20 @@ async fn replace_containers(
             }
             Err(e)
         }
+    }
+}
+
+/// Replicas share their volumes. A database file such as SQLite must have one
+/// writer, which only `scale` 0 (stop first, then start) guarantees.
+fn warn_shared_volumes(spec: &ServiceSpec, progress: &Progress) {
+    if spec.scale > 0 && spec.volumes.iter().any(|v| !v.readonly) {
+        say(
+            progress,
+            format!(
+                "warning: {} replicas share the writable volumes; for a single writer (e.g. SQLite) use scale=0",
+                spec.scale
+            ),
+        );
     }
 }
 
@@ -693,19 +748,25 @@ mod tests {
     fn privileges_and_networks() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths { root: dir.path().to_path_buf() };
-        let mut cfg = ServerConfig::default();
-        cfg.networks.insert("db".into(), crate::config::SharedNetwork { members: vec!["shop-*".into()] });
+        let cfg = ServerConfig::default();
         let limits = cfg.limits().unwrap();
         let user = Caller { key_name: "ci".into(), admin: false };
         let admin = Caller { key_name: "me".into(), admin: true };
 
+        // Shared networks are open: any service may join one by naming it.
         let s = parse_spec("# mypaas.service=shop-web\n# mypaas.network=db\n").unwrap();
         assert!(prepare(&paths, &cfg, &limits, &s, &user).is_ok());
         let s = parse_spec("# mypaas.service=blog\n# mypaas.network=db\n").unwrap();
-        assert!(prepare(&paths, &cfg, &limits, &s, &admin).is_err());
-        let s = parse_spec("# mypaas.service=a\n# mypaas.publish=0.0.0.0:80:80\n").unwrap();
-        assert!(prepare(&paths, &cfg, &limits, &s, &user).is_err());
-        assert!(prepare(&paths, &cfg, &limits, &s, &admin).is_ok());
+        assert!(prepare(&paths, &cfg, &limits, &s, &user).is_ok());
+
+        // No service may route the admin domain, not even admin.
+        let mut with_domain = cfg.clone();
+        with_domain.domain = "paas.example.com".into();
+        for url in ["https://paas.example.com", "http://paas.example.com/v1/services/x/secrets/KEY"] {
+            let s = parse_spec(&format!("# mypaas.service=a\n# mypaas.url={url}\n")).unwrap();
+            let err = prepare(&paths, &with_domain, &limits, &s, &admin).err().unwrap();
+            assert!(format!("{err:#}").contains("admin domain"), "{err:#}");
+        }
         let s = parse_spec("# mypaas.service=a\n# mypaas.maxmem=64g\n").unwrap();
         assert!(prepare(&paths, &cfg, &limits, &s, &admin).is_err());
         let s = parse_spec("# mypaas.service=a\n# mypaas.env=TOKEN\n").unwrap();
@@ -732,6 +793,33 @@ mod tests {
         // cap_add needs admin.
         let s = parse_spec("# mypaas.service=a\n# mypaas.cap_add=NET_ADMIN\n").unwrap();
         assert!(prepare(&paths, &cfg, &limits, &s, &user).is_err());
+    }
+
+    #[test]
+    fn image_labels_cannot_route() {
+        let labels = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        assert!(check_image_labels("shop", &labels(&[("mypaas.service", "shop"), ("org.opencontainers.image.title", "x")])).is_ok());
+        for evil in [
+            ("traefik.enable", "true"),
+            ("traefik.http.routers.x.rule", "Host(`paas.example.com`)"),
+            ("Traefik.Http.Routers.x.priority", "99999"),
+            ("mypaas.spec", "forged"),
+        ] {
+            let err = check_image_labels("shop", &labels(&[evil])).unwrap_err();
+            assert!(format!("{err:#}").contains(evil.0), "{err:#}");
+        }
+        // Claiming to be another service is refused too.
+        assert!(check_image_labels("shop", &labels(&[("mypaas.service", "blog")])).is_err());
+    }
+
+    #[test]
+    fn warns_when_replicas_share_a_writable_volume() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        warn_shared_volumes(&parse_spec("# mypaas.service=a\n# mypaas.volume=d:/d\n").unwrap(), &tx);
+        warn_shared_volumes(&parse_spec("# mypaas.service=a\n# mypaas.scale=2\n# mypaas.volume=d:/d:ro\n").unwrap(), &tx);
+        assert!(rx.try_recv().is_err(), "single container or read-only: no warning");
+        warn_shared_volumes(&parse_spec("# mypaas.service=a\n# mypaas.scale=2\n# mypaas.volume=d:/d\n").unwrap(), &tx);
+        assert!(rx.try_recv().unwrap().contains("SQLite"));
     }
 
     #[test]

@@ -17,10 +17,14 @@ use crate::auth;
 use crate::bundle::{self, Packed};
 use crate::config::{home_dir, write_atomic};
 use crate::server::daemon::{TicketRequest, TicketResponse};
-use crate::spec::{is_valid_host, parse_dockerfile, parse_size};
+use crate::spec::{is_valid_host, parse_dockerfile};
 
-pub const DEFAULT_MAX_UPLOAD: &str = "50m";
-const WARN_UPLOAD: u64 = 20 << 20;
+/// Above this the client warns; the server's `max_upload` is the actual limit.
+const WARN_UPLOAD: u64 = 50 << 20;
+/// How long `push` keeps retrying while the server is busy with another deploy.
+/// Below the ticket's 60 seconds, so the ticket is still valid on the last try.
+const BUSY_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(45);
+const BUSY_RETRY_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// An error with a specific exit code; see the design document.
 #[derive(Debug)]
@@ -270,18 +274,24 @@ pub fn remote_ls(out: Output) -> Result<()> {
     Ok(())
 }
 
-/// `-r name`, `-r https://domain`, `MYPAAS_REMOTE`, or the only remote.
+/// `-r name`, `-r domain`, `-r https://domain`, `MYPAAS_REMOTE`, or the only remote.
 pub fn resolve_remote(arg: Option<&str>) -> Result<String> {
     let env = std::env::var("MYPAAS_REMOTE").ok().filter(|s| !s.is_empty());
     let wanted = arg.map(str::to_string).or(env);
-    let remotes = load_remotes()?;
+    pick_remote(wanted.as_deref(), &load_remotes()?)
+}
+
+fn pick_remote(wanted: Option<&str>, remotes: &Remotes) -> Result<String> {
     match wanted {
-        Some(w) if w.starts_with("https://") => normalize_remote(&w),
+        Some(w) if w.starts_with("https://") => normalize_remote(w),
         // Plain HTTP only to a daemon on this machine, for development.
         Some(w) if w.starts_with("http://127.0.0.1:") || w.starts_with("http://localhost:") => {
             Ok(w.trim_end_matches('/').to_string())
         }
-        Some(w) => remotes.remotes.get(&w).cloned().with_context(|| format!("no remote named {w}; see `mypaas remote ls`")),
+        Some(w) if remotes.remotes.contains_key(w) => Ok(remotes.remotes[w].clone()),
+        // Remote names cannot contain dots, so a dotted name is a domain.
+        Some(w) if w.contains('.') && is_valid_host(w.trim_end_matches('/')) => normalize_remote(w),
+        Some(w) => bail!("no remote named {w}; see `mypaas remote ls`, or pass a domain like paas.example.com"),
         None => match remotes.remotes.len() {
             1 => Ok(remotes.remotes.values().next().unwrap().clone()),
             0 => bail!("no remote configured; add one with `mypaas remote add <name> <admin-domain>`"),
@@ -314,7 +324,11 @@ impl Api {
 
     pub fn new(base: String, key: SigningKey, key_id: String) -> Result<Api> {
         let http = reqwest::Client::builder()
-            .http1_only()
+            // HTTP/2 over TLS (negotiated with ALPN) is full duplex: when the
+            // daemon refuses an upload from its headers (busy, expired ticket),
+            // the answer reaches the client at once. Traefik's HTTP/1.1 side
+            // only passes it on after the whole body has been sent. Plain-HTTP
+            // remotes, for development on loopback, stay on HTTP/1.1.
             .user_agent(concat!("mypaas/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(std::time::Duration::from_secs(15))
             .build()?;
@@ -323,6 +337,18 @@ impl Api {
 
     pub fn base(&self) -> &str {
         &self.base
+    }
+
+    /// The Host header for the remote: the domain, with the port if it is not the default.
+    pub fn host(&self) -> String {
+        match reqwest::Url::parse(&self.base) {
+            Ok(u) => match (u.host_str(), u.port()) {
+                (Some(h), Some(p)) => format!("{h}:{p}"),
+                (Some(h), None) => h.to_string(),
+                _ => String::new(),
+            },
+            Err(_) => String::new(),
+        }
     }
 
     /// Sends a signed request and checks the status.
@@ -335,11 +361,14 @@ impl Api {
     pub async fn send_signed(&self, method: reqwest::Method, path: &str, body: Vec<u8>) -> reqwest::Result<reqwest::Response> {
         let time = auth::unix_now();
         let nonce = hex::encode(rand::random::<[u8; 16]>());
-        let canonical = auth::canonical_string(method.as_str(), path, time, &nonce, &body);
+        let host = self.host();
+        let canonical = auth::canonical_string(method.as_str(), &host, path, time, &nonce, &body);
         let sig = auth::sign(&self.key, &canonical);
         let mut req = self
             .http
             .request(method, format!("{}{path}", self.base))
+            // The signed host is sent as is, so both sides use the same string.
+            .header(reqwest::header::HOST, &host)
             .header(auth::HEADER_KEY, &self.key_id)
             .header(auth::HEADER_TIME, time.to_string())
             .header(auth::HEADER_NONCE, nonce)
@@ -495,11 +524,6 @@ pub async fn push(remote: Option<&str>, path: &Path, dry_run: bool, out: Output)
         }
         return Ok(());
     }
-    let max = parse_size(DEFAULT_MAX_UPLOAD)?;
-    if p.size > max {
-        print_largest(p);
-        bail!("the bundle is {}, above the {} limit; check .gitignore", human(p.size), human(max));
-    }
     if p.size > WARN_UPLOAD {
         eprintln!("warning: the bundle is {}; a stray binary is usually a missing .gitignore entry", human(p.size));
         print_largest(p);
@@ -510,11 +534,35 @@ pub async fn push(remote: Option<&str>, path: &Path, dry_run: bool, out: Output)
     }
 
     let req = TicketRequest { service: spec.service.clone(), size: p.size, sha256: p.sha256.clone() };
-    let resp = api.signed(reqwest::Method::POST, "/v1/deploy-tickets", serde_json::to_vec(&req)?).await?;
-    let ticket: TicketResponse = resp.json().await.context("invalid ticket response")?;
+    let resp = api
+        .send_signed(reqwest::Method::POST, "/v1/deploy-tickets", serde_json::to_vec(&req)?)
+        .await
+        .with_context(|| format!("cannot reach {}", api.base))?;
+    if resp.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+        // The server's max_upload decides; show what makes the bundle big.
+        print_largest(p);
+    }
+    let ticket: TicketResponse = check_status(resp).await?.json().await.context("invalid ticket response")?;
+    let issued = std::time::Instant::now();
 
-    let file = tokio::fs::File::open(&bundle.path).await?;
-    let total = p.size;
+    // The server keeps the ticket valid while it is busy, so a 409 is retried.
+    loop {
+        let resp = upload(&api, &bundle.path, p.size, &ticket.ticket, out).await?;
+        if resp.status() == reqwest::StatusCode::CONFLICT && issued.elapsed() + BUSY_RETRY_EVERY < BUSY_RETRY_FOR {
+            if !out.quiet && !out.json {
+                eprintln!("the server is busy with another deploy; retrying in {}s", BUSY_RETRY_EVERY.as_secs());
+            }
+            tokio::time::sleep(BUSY_RETRY_EVERY).await;
+            continue;
+        }
+        let resp = check_status(resp).await?;
+        return follow_progress(resp, out).await;
+    }
+}
+
+/// One `PUT /v1/deploy` with a progress bar on a terminal.
+async fn upload(api: &Api, path: &Path, total: u64, ticket: &str, out: Output) -> Result<reqwest::Response> {
+    let file = tokio::fs::File::open(path).await?;
     let show = !out.quiet && !out.json && std::io::stderr().is_terminal();
     let mut sent = 0u64;
     let stream = tokio_util::io::ReaderStream::new(file).inspect(move |chunk| {
@@ -531,18 +579,15 @@ pub async fn push(remote: Option<&str>, path: &Path, dry_run: bool, out: Output)
             }
         }
     });
-    let resp = api
-        .http
+    api.http
         .put(format!("{}/v1/deploy", api.base))
-        .bearer_auth(&ticket.ticket)
+        .bearer_auth(ticket)
         .header("content-length", total.to_string())
         .header("content-type", "application/zstd")
         .body(reqwest::Body::wrap_stream(stream))
         .send()
         .await
-        .context("upload failed")?;
-    let resp = check_status(resp).await?;
-    follow_progress(resp, out).await
+        .context("upload failed")
 }
 
 pub async fn rollback(remote: Option<&str>, service: &str, out: Output) -> Result<()> {
@@ -555,4 +600,25 @@ pub async fn rm(remote: Option<&str>, service: &str, out: Output) -> Result<()> 
     let api = Api::connect(remote)?;
     let resp = api.signed(reqwest::Method::DELETE, &format!("/v1/services/{service}"), Vec::new()).await?;
     follow_progress(resp, out).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_forms() {
+        let mut r = Remotes::default();
+        r.remotes.insert("prod".into(), "https://paas.example.com".into());
+        assert_eq!(pick_remote(Some("prod"), &r).unwrap(), "https://paas.example.com");
+        assert_eq!(pick_remote(Some("other.example.org"), &r).unwrap(), "https://other.example.org");
+        assert_eq!(pick_remote(Some("https://x.example.org/"), &r).unwrap(), "https://x.example.org");
+        assert_eq!(pick_remote(Some("http://127.0.0.1:88"), &r).unwrap(), "http://127.0.0.1:88");
+        assert_eq!(pick_remote(None, &r).unwrap(), "https://paas.example.com");
+        assert!(pick_remote(Some("staging"), &r).is_err());
+        assert!(pick_remote(Some("bad..host"), &r).is_err());
+        assert!(pick_remote(Some("http://example.com"), &r).is_err(), "plain HTTP only on loopback");
+        r.remotes.insert("b".into(), "https://b.example.com".into());
+        assert!(pick_remote(None, &r).is_err(), "several remotes need -r");
+    }
 }

@@ -60,7 +60,7 @@ fn is_id(s: &str) -> bool {
 }
 
 /// The calls Traefik's Docker provider makes, and nothing else. Verified against
-/// Traefik 3.6.1: HEAD /_ping, GET /version, /containers/json, /containers/<id>/json
+/// Traefik 3.7.17: HEAD /_ping, GET /version, /containers/json, /containers/<id>/json
 /// and /events.
 pub fn allowed(method: &Method, path: &str) -> bool {
     if method != Method::GET && method != Method::HEAD {

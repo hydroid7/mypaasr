@@ -38,8 +38,9 @@ struct Env {
 }
 
 impl Env {
-    /// `shared` lists shared networks as (name, member services without the tag).
-    fn new(shared: &[(&str, &[&str])]) -> Env {
+    /// `shared` lists the shared networks the test uses (without the tag), so
+    /// they are removed afterwards.
+    fn new(shared: &[&str]) -> Env {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let tag = format!("it{:06x}", rand::random::<u32>() & 0xff_ffff);
@@ -52,13 +53,7 @@ impl Env {
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let mut cfg = std::fs::read_to_string(home.join("config.toml")).unwrap();
         cfg = cfg.replace("listen = \"127.0.0.1:88\"", &format!("listen = \"127.0.0.1:{port}\""));
-        let mut networks = Vec::new();
-        for (name, members) in shared {
-            let net = format!("{tag}-{name}");
-            let members: Vec<String> = members.iter().map(|m| format!("\"{tag}-{m}\"")).collect();
-            cfg.push_str(&format!("\n[networks.{net}]\nmembers = [{}]\n", members.join(", ")));
-            networks.push(format!("mypaas-net-{net}"));
-        }
+        let networks = shared.iter().map(|name| format!("mypaas-net-{tag}-{name}")).collect();
         std::fs::write(home.join("config.toml"), cfg).unwrap();
 
         let generated = Command::new(BIN).args(["key", "gen"]).output().unwrap();
@@ -306,12 +301,12 @@ fn daemon_restores_containers_after_an_interrupted_deploy() {
     assert_eq!(http_from(&svc, "http://127.0.0.1:8080/").as_deref(), Some("alive"));
 }
 
-/// Phase 3 exit test, first half: services are isolated unless a shared
-/// network is declared on the server and they are listed as members.
+/// Phase 3 exit test, first half: services are isolated unless they join the
+/// same shared network, which any service can do by naming it.
 #[test]
 #[ignore = "needs docker"]
 fn services_are_isolated_unless_they_share_a_network() {
-    let env = Env::new(&[("db", &["db", "member"])]);
+    let env = Env::new(&["db"]);
     let net = format!("{}-db", env.tag);
     let db = env.svc("db");
     let shared = format!("# mypaas.port=8080\n# mypaas.network={net}");
@@ -321,17 +316,34 @@ fn services_are_isolated_unless_they_share_a_network() {
 
     let member = env.svc("member");
     let loner = env.svc("loner");
-    assert_eq!(http_from(&member, &format!("http://{db}:8080/")).as_deref(), Some("data"), "members reach each other by name");
+    assert_eq!(http_from(&member, &format!("http://{db}:8080/")).as_deref(), Some("data"), "services on a shared network reach each other by name");
     let db_ip = docker(&["inspect", "--format", &format!("{{{{(index .NetworkSettings.Networks \"mypaas-net-{net}\").IPAddress}}}}"), &db]);
-    assert_eq!(http_from(&loner, &format!("http://{db_ip}:8080/")), None, "a non-member cannot reach it even by address");
+    assert_eq!(http_from(&loner, &format!("http://{db_ip}:8080/")), None, "a service off the network cannot reach it even by address");
     let own_ip = docker(&["inspect", "--format", &format!("{{{{(index .NetworkSettings.Networks \"mypaas-{member}\").IPAddress}}}}"), &member]);
     assert_eq!(http_from(&loner, &format!("http://{own_ip}:8080/")), None, "nor another service's own network");
 
-    // Writing the same comment does not make a service a member.
-    let (code, out) = env.push(&env.project("intruder", &shared, &serve("x")));
-    assert_eq!(code, 4);
-    assert!(out.iter().any(|l| l.contains("not a member")), "{out:?}");
-    assert!(env.containers("intruder").is_empty());
+    // Joining is open: naming the network is enough, even for a late arrival.
+    assert_eq!(env.push(&env.project("late", &shared, &serve("x"))).0, 0);
+    assert_eq!(http_from(&env.svc("late"), &format!("http://{db}:8080/")).as_deref(), Some("data"));
+}
+
+/// Docker copies image labels onto containers and Traefik routes by them, so a
+/// `LABEL traefik.…` in a Dockerfile could take over any domain, the admin
+/// API's included. Such an image is refused and the running version stays.
+#[test]
+#[ignore = "needs docker"]
+fn image_labels_cannot_hijack_routes() {
+    let env = Env::new(&[]);
+    let svc = env.svc("hijack");
+    assert_eq!(env.push(&env.project("hijack", "# mypaas.port=8080", &serve("good"))).0, 0);
+    let evil = format!("LABEL traefik.enable=true traefik.http.routers.evil.rule=\"Host(`test.local`)\" traefik.http.routers.evil.priority=999999\n{}", serve("evil"));
+    let (code, out) = env.push(&env.project("hijack", "# mypaas.port=8080", &evil));
+    assert_eq!(code, 4, "{out:?}");
+    assert!(out.iter().any(|l| l.contains("only mypaas may set") && l.contains("traefik.http.routers.evil.rule")), "{out:?}");
+    assert_eq!(env.containers("hijack"), vec![format!("{svc} running")], "the old version keeps running");
+    let labels = docker(&["inspect", "--format", "{{json .Config.Labels}}", &svc]);
+    assert!(!labels.contains("traefik.http.routers.evil"), "{labels}");
+    assert_eq!(http_from(&svc, "http://127.0.0.1:8080/").as_deref(), Some("good"));
 }
 
 #[test]
@@ -374,13 +386,20 @@ impl Router {
         let mount = |src: &Path, dst: &str, ro: bool| {
             format!("type=bind,source={},target={dst}{}", src.display(), if ro { ",readonly" } else { "" })
         };
+        // The same flags as `mypaas server restart router` (setup::ROUTER_HARDENING).
+        // On a server Traefik runs as root without capabilities, and the files it
+        // reads belong to root. Here they belong to the test's user, so Traefik
+        // runs as that user: without CAP_DAC_OVERRIDE, only owners get access.
+        let user = format!("{}:{}", unsafe { libc::getuid() }, unsafe { libc::getgid() });
         let ok = docker_ok(&[
-            "run", "-d", "--name", &container, "--network", "host",
+            "run", "-d", "--name", &container, "--network", "host", "--user", &user,
+            "--cap-drop", "ALL", "--cap-add", "NET_BIND_SERVICE", "--security-opt", "no-new-privileges",
+            "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=16m", "--memory", "512m", "--pids-limit", "512",
             "--mount", &mount(&cfg_path, "/traefik.toml", true),
             "--mount", &mount(&env.home.join("staticroutes.toml"), "/staticroutes.toml", true),
             "--mount", &mount(&env.home.join("run"), "/mypaas-run", true),
             "--mount", &mount(&env.home.join("logs"), "/mypaas-logs", false),
-            "traefik:v3.6.1", "--configFile=/traefik.toml",
+            "traefik:v3.7.17", "--configFile=/traefik.toml",
         ]);
         assert!(ok, "cannot start traefik");
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -414,7 +433,7 @@ impl Drop for Router {
 /// in the stats with exact counts and plausible latencies, and the access log
 /// holds no client addresses or paths.
 #[test]
-#[ignore = "needs docker and the traefik:v3.6.1 image"]
+#[ignore = "needs docker and the traefik:v3.7.17 image"]
 fn traffic_stats_match_the_requests_sent() {
     let env = Env::new(&[]);
     let svc = env.svc("traffic");
@@ -431,7 +450,10 @@ fn traffic_stats_match_the_requests_sent() {
     // Traefik picks the new container up from Docker events.
     let deadline = Instant::now() + Duration::from_secs(20);
     while router.get(&host, "/") != 200 {
-        assert!(Instant::now() < deadline, "traefik never routed to the service");
+        if Instant::now() > deadline {
+            let logs = Command::new("docker").args(["logs", "--tail", "30", &router.container]).output().unwrap();
+            panic!("traefik never routed to the service; its log:\n{}", String::from_utf8_lossy(&logs.stderr));
+        }
         std::thread::sleep(Duration::from_millis(300));
     }
     let sent = [("/", 200, 19), ("/missing", 404, 5), ("/cgi-bin/fail", 500, 3), ("/cgi-bin/slow", 200, 4)];

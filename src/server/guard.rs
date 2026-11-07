@@ -23,6 +23,11 @@ pub const MAX_TICKETS_PER_KEY: usize = 2;
 
 pub const SIG_CHECKS_PER_SEC: u32 = 50;
 
+/// Requests one client address may have in flight. Failures are counted when
+/// a request ends, so without this one address could open many slow requests
+/// at once, all before its first failure, and hold every daemon connection.
+pub const MAX_IN_FLIGHT_PER_IP: u32 = 8;
+
 /// IPv4 addresses are tracked exactly, IPv6 per /64.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IpKey(u128);
@@ -197,6 +202,33 @@ impl Tickets {
     }
 }
 
+/// Requests in flight per client address. Entries disappear at zero, so the
+/// table holds at most one entry per open request.
+#[derive(Default)]
+pub struct InFlight {
+    count: HashMap<IpKey, u32>,
+}
+
+impl InFlight {
+    pub fn try_enter(&mut self, ip: IpKey) -> bool {
+        let n = self.count.entry(ip).or_default();
+        if *n >= MAX_IN_FLIGHT_PER_IP {
+            return false;
+        }
+        *n += 1;
+        true
+    }
+
+    pub fn leave(&mut self, ip: IpKey) {
+        if let Some(n) = self.count.get_mut(&ip) {
+            *n -= 1;
+            if *n == 0 {
+                self.count.remove(&ip);
+            }
+        }
+    }
+}
+
 /// A token bucket for the global cap on signature checks.
 pub struct RateLimiter {
     per_sec: u32,
@@ -322,6 +354,24 @@ mod tests {
         assert!(ts.peek("deadbeef", t).is_none());
         // Expired tickets are gone and free their slots.
         assert!(ts.issue(ticket("k4", exp + TICKET_TTL), exp).is_ok());
+    }
+
+    #[test]
+    fn in_flight_per_address() {
+        let mut f = InFlight::default();
+        let (a, b) = (ip("10.0.0.1"), ip("10.0.0.2"));
+        for _ in 0..MAX_IN_FLIGHT_PER_IP {
+            assert!(f.try_enter(a));
+        }
+        assert!(!f.try_enter(a), "one address cannot take every connection");
+        assert!(f.try_enter(b), "others are unaffected");
+        f.leave(a);
+        assert!(f.try_enter(a));
+        for _ in 0..MAX_IN_FLIGHT_PER_IP {
+            f.leave(a);
+        }
+        f.leave(b);
+        assert!(f.count.is_empty(), "no entries are left behind");
     }
 
     #[test]
