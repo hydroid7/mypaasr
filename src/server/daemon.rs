@@ -146,8 +146,10 @@ pub async fn run(paths: Paths) -> Result<()> {
     tracing::info!("mypaas daemon listening on {addr}");
     let state = Arc::new(State::new(paths.clone()));
     if cfg.stats.enabled {
-        tokio::spawn(stats::run(paths, state.stats.clone()));
+        tokio::spawn(stats::run(paths.clone(), state.stats.clone()));
     }
+    // Uptime and resource history needs no access log, so it always runs.
+    tokio::spawn(api::sample_loop(paths, state.stats.clone()));
     serve(listener, state).await
 }
 

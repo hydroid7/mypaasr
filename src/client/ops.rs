@@ -15,7 +15,7 @@ use crate::spec::{is_valid_env_name, is_valid_name, parse_duration_ms};
 const TOP_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_SECRET_VALUE: usize = 16 * 1024;
 
-fn check_service(name: &str) -> Result<()> {
+pub(super) fn check_service(name: &str) -> Result<()> {
     if !is_valid_name(name) {
         bail!("invalid service name {name:?}");
     }
@@ -32,7 +32,7 @@ pub fn age(secs: u64) -> String {
     }
 }
 
-fn health_color(h: &str) -> &'static str {
+pub(super) fn health_color(h: &str) -> &'static str {
     match h {
         "healthy" | "running" => GREEN,
         "down" => RED,
@@ -90,7 +90,7 @@ pub async fn ls(remote: Option<&str>, out: Output) -> Result<()> {
     Ok(())
 }
 
-fn format_time(unix: u64) -> String {
+pub(super) fn format_time(unix: u64) -> String {
     format!("{} {:02}:{:02} UTC", auth::format_date(unix), (unix % 86_400) / 3600, (unix % 3600) / 60)
 }
 
@@ -311,16 +311,16 @@ pub async fn logs(remote: Option<&str>, service: &str, args: LogArgs, out: Outpu
 }
 
 /// Restores the terminal when `top` ends, also on errors.
-struct Screen;
+pub(super) struct Screen;
 
 impl Screen {
-    fn enter() -> Result<Screen> {
+    pub(super) fn enter() -> Result<Screen> {
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen, crossterm::cursor::Hide)?;
         Ok(Screen)
     }
 
-    fn draw(&self, lines: &[String]) -> Result<()> {
+    pub(super) fn draw(&self, lines: &[String]) -> Result<()> {
         use crossterm::{cursor::MoveTo, queue, terminal};
         let mut stdout = std::io::stdout();
         // Some terminals (and fresh ptys) report 0x0.
@@ -368,7 +368,7 @@ fn truncate_visible(line: &str, width: usize) -> String {
 }
 
 /// Waits up to `d` for `q`, Esc or Ctrl-C. Returns true to quit.
-fn wait_for_quit(d: Duration) -> Result<bool> {
+pub(super) fn wait_for_quit(d: Duration) -> Result<bool> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     let deadline = std::time::Instant::now() + d;
     loop {

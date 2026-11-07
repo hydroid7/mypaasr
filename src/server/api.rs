@@ -120,6 +120,37 @@ pub async fn list_services(paths: &Paths, stats: &std::sync::Mutex<StatsStore>) 
     Ok(json!({ "services": services }))
 }
 
+/// Records one sample of every deployed service: replicas running, memory and CPU.
+pub async fn sample_usage(paths: &Paths, stats: &std::sync::Mutex<StatsStore>) -> Result<()> {
+    let all = list_containers(None).await?;
+    let running: Vec<&str> = all.iter().filter(|c| c.running).map(|c| c.name.as_str()).collect();
+    let usage = container_stats(&running).await?;
+    let now = crate::auth::unix_now();
+    let mut rows = Vec::new();
+    for name in service_names(paths) {
+        let Some(rec) = current_record(paths, &name)? else { continue };
+        let mine = current_containers(&all, &name);
+        let u = sum_usage(&mine, &usage);
+        let up = mine.iter().filter(|c| c.running).count() as u32;
+        rows.push((name, up, rec.spec.scale.max(1), u));
+    }
+    let mut store = stats.lock().unwrap_or_else(|e| e.into_inner());
+    for (name, up, wanted, u) in rows {
+        store.record_usage(&name, now, up, wanted, u.mem_bytes, u.cpu_percent);
+    }
+    store.save(now)
+}
+
+/// Runs forever in the daemon, once a minute.
+pub async fn sample_loop(paths: Paths, stats: std::sync::Arc<std::sync::Mutex<StatsStore>>) {
+    loop {
+        if let Err(e) = sample_usage(&paths, &stats).await {
+            tracing::warn!("usage sample: {e:#}");
+        }
+        tokio::time::sleep(super::stats::SAMPLE_INTERVAL).await;
+    }
+}
+
 #[derive(Serialize)]
 struct VolumeView {
     source: String,

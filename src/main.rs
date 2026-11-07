@@ -75,6 +75,17 @@ enum Command {
         #[arg(long, value_parser = ["hour", "day"])]
         by: Option<String>,
     },
+    /// Uptime, memory and request history as terminal charts.
+    Dashboard {
+        /// Show full charts for this service; without it, one row per service.
+        service: Option<String>,
+        /// How far back, e.g. 24h, 7d, 90d (hourly up to 14d, daily beyond).
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// Redraw full-screen every 10 seconds; q quits.
+        #[arg(short, long)]
+        watch: bool,
+    },
     /// Manage a service's secrets; values are never shown.
     #[command(subcommand)]
     Secret(SecretCmd),
@@ -231,6 +242,9 @@ async fn run(cli: Cli, out: Output) -> Result<()> {
         }
         Command::Top => client::ops::top(remote, out).await,
         Command::Stats { service, since, by } => client::ops::stats(remote, &service, &since, by.as_deref(), out).await,
+        Command::Dashboard { service, since, watch } => {
+            client::dashboard::dashboard(remote, client::dashboard::DashboardArgs { service, since, watch }, out).await
+        }
         Command::Secret(SecretCmd::Set { service, key }) => client::ops::secret_set(remote, &service, &key, out).await,
         Command::Secret(SecretCmd::Ls { service }) => client::ops::secret_ls(remote, &service, out).await,
         Command::Secret(SecretCmd::Rm { service, key }) => client::ops::secret_rm(remote, &service, &key, out).await,

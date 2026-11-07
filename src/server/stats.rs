@@ -1,9 +1,14 @@
-//! Traffic stats from Traefik's JSON access log.
+//! Per-service history: traffic from Traefik's JSON access log, and uptime and
+//! resource use from samples of the containers.
 //!
 //! The daemon tails the log, counts requests per service in hourly buckets
 //! (status classes and a latency histogram) and keeps them for the configured
 //! retention. The access log only has the fields needed here; client addresses,
 //! paths and headers are dropped by Traefik before they reach the disk.
+//!
+//! Once a minute it also records, per deployed service, whether its replicas
+//! are running and how much memory and CPU they use, into hourly buckets of
+//! the same retention.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -25,6 +30,7 @@ pub const ACCESS_LOG: &str = "access.log";
 /// Where Traefik sees the log directory.
 pub const LOG_MOUNT: &str = "/mypaas-logs";
 const INGEST_INTERVAL: Duration = Duration::from_secs(10);
+pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
 /// The log is rotated once this much of it has been read.
 const ROTATE_AT: u64 = 32 << 20;
 const MAX_LINE: usize = 64 * 1024;
@@ -107,10 +113,62 @@ impl Bucket {
     }
 }
 
+/// Container samples of one hour (or, merged, of a longer period).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Usage {
+    pub samples: u32,
+    /// Samples with at least one replica running.
+    pub up: u32,
+    /// Samples with every wanted replica running.
+    pub full: u32,
+    pub mem_sum: u64,
+    pub mem_max: u64,
+    pub cpu_sum: f64,
+}
+
+impl Usage {
+    fn add(&mut self, running: u32, wanted: u32, mem: u64, cpu: f64) {
+        self.samples += 1;
+        self.up += u32::from(running > 0);
+        self.full += u32::from(running >= wanted.max(1));
+        self.mem_sum += mem;
+        self.mem_max = self.mem_max.max(mem);
+        self.cpu_sum += cpu;
+    }
+
+    fn merge(&mut self, o: &Usage) {
+        self.samples += o.samples;
+        self.up += o.up;
+        self.full += o.full;
+        self.mem_sum += o.mem_sum;
+        self.mem_max = self.mem_max.max(o.mem_max);
+        self.cpu_sum += o.cpu_sum;
+    }
+
+    /// Fractions and averages; `null` where nothing was sampled.
+    fn to_json(&self) -> Value {
+        if self.samples == 0 {
+            return json!({ "uptime": null, "full_uptime": null, "mem_avg": null, "mem_max": null, "cpu_avg": null });
+        }
+        let n = self.samples as f64;
+        let round = |x: f64, d: f64| (x * d).round() / d;
+        json!({
+            "uptime": round(self.up as f64 / n, 10_000.0),
+            "full_uptime": round(self.full as f64 / n, 10_000.0),
+            "mem_avg": self.mem_sum / self.samples as u64,
+            "mem_max": self.mem_max,
+            "cpu_avg": round(self.cpu_sum / n, 100.0),
+        })
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ServiceStats {
     /// Hour index (unix time / 3600) to bucket.
     hours: BTreeMap<u64, Bucket>,
+    /// Hour index to container samples.
+    #[serde(default)]
+    usage: BTreeMap<u64, Usage>,
     /// Requests per minute for the last hour, as (minute index, count) slots.
     /// Not persisted: it only feeds the live request rate.
     #[serde(skip)]
@@ -202,13 +260,21 @@ impl StatsStore {
         self.dirty.insert(service.to_string());
     }
 
+    /// One container sample of a deployed service.
+    pub fn record_usage(&mut self, service: &str, t: u64, running: u32, wanted: u32, mem: u64, cpu: f64) {
+        let s = self.services.entry(service.to_string()).or_default();
+        s.usage.entry(t / 3600).or_default().add(running, wanted, mem, cpu);
+        self.dirty.insert(service.to_string());
+    }
+
     /// Drops buckets past the retention and writes changed services to disk.
     pub fn save(&mut self, now: u64) -> Result<()> {
         let oldest = (now / 3600).saturating_sub(self.retention_hours);
         for (name, s) in &mut self.services {
-            let before = s.hours.len();
+            let before = s.hours.len() + s.usage.len();
             s.hours.retain(|h, _| *h >= oldest);
-            if s.hours.len() != before {
+            s.usage.retain(|h, _| *h >= oldest);
+            if s.hours.len() + s.usage.len() != before {
                 self.dirty.insert(name.clone());
             }
         }
@@ -239,25 +305,37 @@ impl StatsStore {
     pub fn query(&self, service: &str, since: u64, by_day: bool, now: u64) -> Value {
         let step = if by_day { 86_400 } else { 3600 };
         let first = (now.saturating_sub(since) / step) * step;
-        let mut buckets: BTreeMap<u64, Bucket> = (0..)
+        let mut buckets: BTreeMap<u64, (Bucket, Usage)> = (0..)
             .map(|i| first + i * step)
             .take_while(|t| *t <= now)
-            .map(|t| (t, Bucket::default()))
+            .map(|t| (t, Default::default()))
             .collect();
-        let mut total = Bucket::default();
+        let mut total = (Bucket::default(), Usage::default());
         if let Some(s) = self.services.get(service) {
             for (hour, b) in s.hours.range(first / 3600..) {
-                let t = (hour * 3600 / step) * step;
-                if let Some(target) = buckets.get_mut(&t) {
-                    target.merge(b);
-                    total.merge(b);
+                if let Some(target) = buckets.get_mut(&((hour * 3600 / step) * step)) {
+                    target.0.merge(b);
+                    total.0.merge(b);
+                }
+            }
+            for (hour, u) in s.usage.range(first / 3600..) {
+                if let Some(target) = buckets.get_mut(&((hour * 3600 / step) * step)) {
+                    target.1.merge(u);
+                    total.1.merge(u);
                 }
             }
         }
+        let both = |b: &Bucket, u: &Usage| {
+            let mut v = b.to_json();
+            if let (Some(o), Value::Object(extra)) = (v.as_object_mut(), u.to_json()) {
+                o.extend(extra);
+            }
+            v
+        };
         let list: Vec<Value> = buckets
             .iter()
-            .map(|(t, b)| {
-                let mut v = b.to_json();
+            .map(|(t, (b, u))| {
+                let mut v = both(b, u);
                 v["t"] = json!(t);
                 v
             })
@@ -266,7 +344,7 @@ impl StatsStore {
             "service": service,
             "by": if by_day { "day" } else { "hour" },
             "since": since,
-            "total": total.to_json(),
+            "total": both(&total.0, &total.1),
             "buckets": list,
         })
     }
@@ -500,6 +578,34 @@ mod tests {
         assert_eq!(StatsStore::load(&paths, 90).query("shop", 100 * 86_400, true, now + 2 * 86_400)["total"]["requests"], 1);
         s.remove("shop");
         assert_eq!(StatsStore::load(&paths, 90).query("shop", 86_400, true, now)["total"]["requests"], 0);
+    }
+
+    #[test]
+    fn usage_samples_become_uptime_and_memory() {
+        let (_d, paths, mut st) = store();
+        let now = 1_000 * 3600 + 1800;
+        // Hour 1: two replicas wanted, four samples: all up, all up, one up, none.
+        let h1 = now - 3600;
+        st.record_usage("shop", h1, 2, 2, 100, 10.0);
+        st.record_usage("shop", h1 + 60, 2, 2, 300, 30.0);
+        st.record_usage("shop", h1 + 120, 1, 2, 200, 20.0);
+        st.record_usage("shop", h1 + 180, 0, 2, 0, 0.0);
+        st.record_usage("shop", now, 2, 2, 500, 5.0);
+        let v = st.query("shop", 2 * 3600, false, now);
+        let b = &v["buckets"].as_array().unwrap();
+        assert_eq!(b.len(), 3);
+        assert_eq!(b[0]["uptime"], Value::Null, "no samples is unknown, not down");
+        assert_eq!(b[1]["uptime"], 0.75);
+        assert_eq!(b[1]["full_uptime"], 0.5);
+        assert_eq!(b[1]["mem_avg"], 150);
+        assert_eq!(b[1]["mem_max"], 300);
+        assert_eq!(b[1]["cpu_avg"], 15.0);
+        assert_eq!(v["total"]["mem_max"], 500);
+        assert_eq!(v["total"]["uptime"], 0.8);
+        // Persisted with the traffic buckets, and dropped with them.
+        st.save(now).unwrap();
+        let back = StatsStore::load(&paths, 90);
+        assert_eq!(back.query("shop", 2 * 3600, false, now)["total"]["mem_max"], 500);
     }
 
     #[test]

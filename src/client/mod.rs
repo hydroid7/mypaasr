@@ -1,5 +1,7 @@
 //! The client CLI: keys, remotes, signed requests and `push`.
 
+pub mod chart;
+pub mod dashboard;
 pub mod ops;
 
 use std::collections::BTreeMap;
