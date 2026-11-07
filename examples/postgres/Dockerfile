@@ -1,8 +1,7 @@
-# One Postgres shared by several services over the `db` network.
-#
-# Server config.toml:
-#   [networks.db]
-#   members = ["postgres", "shop", "blog"]
+# One Postgres shared by several services over the `db` network. Every
+# service that names `db` joins it; nothing is configured on the server. The
+# network only connects the containers: each app still gets its own role,
+# which may connect to its own database only.
 #
 # Secrets (mypaas secret set postgres <KEY>):
 #   POSTGRES_PASSWORD, SHOP_DB_PASSWORD, BLOG_DB_PASSWORD

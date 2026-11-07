@@ -1,0 +1,5 @@
+# Only what is listed in .gitignore files inside the project stays out of the
+# bundle; global ignore rules on your machine do not apply.
+__pycache__/
+*.pyc
+.env

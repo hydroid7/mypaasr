@@ -1,0 +1,23 @@
+# The staging deployment of the same project as Dockerfile.prod.
+#
+# The service name, not the directory, is a deployment's identity, so the two
+# Dockerfiles are independent services with their own containers, network,
+# volumes, secrets and rollback history:
+#
+#   mypaas push examples/staging-prod/Dockerfile.staging
+#   mypaas push examples/staging-prod/Dockerfile.prod
+#
+# Give CI one key per environment, e.g. --scope 'deploy:store-staging' for
+# every branch and --scope 'deploy:store' for main only.
+
+# mypaas.service=store-staging
+# mypaas.url=https://staging.store.example.com
+# mypaas.port=8000
+# mypaas.env=APP_ENV=staging
+# mypaas.maxmem=128m
+
+FROM python:3.13-slim
+WORKDIR /app
+COPY app.py .
+USER 1000
+CMD ["python", "-u", "app.py"]

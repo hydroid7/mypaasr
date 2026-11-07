@@ -1,0 +1,19 @@
+# The production deployment; see Dockerfile.staging for how the two relate.
+# Production runs two replicas with zero-downtime rolling deploys and reads
+# its secret from the server (mypaas secret set store SESSION_KEY).
+
+# mypaas.service=store
+# mypaas.url=https://store.example.com
+# mypaas.port=8000
+# mypaas.env=APP_ENV=production
+# mypaas.env=SESSION_KEY
+# mypaas.scale=2 roll
+# mypaas.healthcheck=/health 10s 2s
+# mypaas.maxmem=256m
+# mypaas.maxcpu=1
+
+FROM python:3.13-slim
+WORKDIR /app
+COPY app.py .
+USER 1000
+CMD ["python", "-u", "app.py"]
