@@ -28,6 +28,7 @@ cargo test                                  # unit tests, no Docker needed (~1s)
 cargo test --test docker -- --ignored       # end-to-end, needs Docker, busybox:1.36, traefik:v<TRAEFIK_VERSION>
 cargo clippy --all-targets                  # must stay warning-free
 scripts/build-static.sh                     # musl static binary in target-musl/
+scripts/build-deb.sh                        # .deb of that binary in target-deb/
 scripts/vm-test.sh up|test|ssh|down         # full run on a local Debian VM (QEMU/KVM)
 ```
 
@@ -55,6 +56,8 @@ remote on loopback only: `mypaas -r http://127.0.0.1:88 ls`.
 | `src/server/setup.rs` | `server init`, keys, Traefik files, systemd units, restart |
 | `src/server/sockproxy.rs` | Read-only Docker socket proxy for Traefik |
 | `src/server/stats.rs` | History: access log ingest and usage samples in hourly buckets |
+| `.github/workflows/` | `ci.yml` (clippy, tests, Docker tests, builds, .deb install check) and `release.yml` (tag `v<version>` → GitHub release) |
+| `scripts/` | `build-static.sh`, `build-deb.sh` (package metadata and maintainer scripts inline), `vm-test.sh` |
 | `tests/docker.rs` | `#[ignore]`d end-to-end tests against a real Docker |
 | `examples/` | Deployable example services, one per pattern; index in [examples/README.md](examples/README.md) |
 | `docs/` | [design.md](docs/design.md) (specification and decisions log), [security.md](docs/security.md) (security review, remaining risk, operator checklist), [ci.md](docs/ci.md) (deploying from CI) |
@@ -118,5 +121,9 @@ without an explicit decision recorded in the design document.
   bump them, also update
   `tests/docker.rs`, the call list in `sockproxy.rs`, the README and the design
   document, which repeat the version.
+- A release is a tag `v<version>` matching `Cargo.toml`; `release.yml` refuses
+  any other. Actions in the workflows are pinned by commit SHA with the tag in
+  a comment; keep it that way when bumping them. The build job must not get
+  `contents: write`.
 - The `target*/` directories are build outputs and the VM disk. Never commit
   them.

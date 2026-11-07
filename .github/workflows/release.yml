@@ -1,0 +1,109 @@
+# Builds a release from a version tag:
+#
+#   # bump `version` in Cargo.toml, commit, then
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# The release gets the static binary, the .deb, SHA256SUMS and build
+# provenance (`gh attestation verify <file> --repo hydroid7/mypaasr`).
+# Tags with a hyphen (v0.2.0-rc.1) become pre-releases.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Runs the project's code, so it gets no write access to the repository.
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write       # build provenance
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The tag matches Cargo.toml
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $version"
+            exit 1
+          fi
+      - run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: scripts/build-static.sh
+      - run: scripts/build-deb.sh
+      - name: Collect the release files
+        run: |
+          mkdir dist
+          cp target-musl/x86_64-unknown-linux-musl/release/mypaas dist/mypaas-x86_64-linux
+          cp target-deb/*.deb dist/
+          cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/mypaas-x86_64-linux
+            dist/*.deb
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+
+  # Only uploads what build produced; runs nothing from the repository.
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=${TAG#v}
+          cat > notes.md <<EOF
+          ## Install
+
+          On a Debian or Ubuntu server (amd64), as root:
+
+          \`\`\`sh
+          curl -fLO https://github.com/$GH_REPO/releases/download/$TAG/mypaas_${version}_amd64.deb
+          apt install ./mypaas_${version}_amd64.deb
+          mypaas server init --domain paas.example.com --key mykey.pub
+          \`\`\`
+
+          Anywhere else (any x86_64 Linux, also for CI):
+
+          \`\`\`sh
+          curl -fL https://github.com/$GH_REPO/releases/download/$TAG/mypaas-x86_64-linux -o mypaas
+          chmod +x mypaas
+          \`\`\`
+
+          Check a download with \`sha256sum -c SHA256SUMS --ignore-missing\` or
+          \`gh attestation verify <file> --repo $GH_REPO\`.
+          EOF
+          pre=""
+          case "$TAG" in *-*) pre="--prerelease" ;; esac
+          gh release create "$TAG" dist/* --verify-tag --title "mypaas $version" \
+            --notes-file notes.md --generate-notes $pre

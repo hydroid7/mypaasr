@@ -2,3 +2,4 @@
 /target-debian
 /target-musl
 /target-vm
+/target-deb

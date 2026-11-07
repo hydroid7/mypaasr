@@ -25,6 +25,7 @@ The full design, including the threat model, is in
 - [Security model](#security-model)
 - [Development](#development)
 - [Status](#status)
+- [License](#license)
 
 ## Quick start
 
@@ -33,13 +34,32 @@ The full design, including the threat model, is in
 You need a Linux server with Docker and systemd, and a DNS name for the admin
 API (here `paas.example.com`) pointing at it. Ports 80 and 443 must be free.
 
-Build the statically linked binary (needs only Docker on your machine; it runs
-on any x86_64 Linux, whatever its glibc) and copy it to the server:
+Install mypaas from the [latest release](https://github.com/hydroid7/mypaasr/releases/latest).
+On Debian or Ubuntu (amd64), as root, take the `.deb` (replace `0.1.0` with
+the release's version):
 
 ```sh
-scripts/build-static.sh
-scp target-musl/x86_64-unknown-linux-musl/release/mypaas root@server:/usr/local/bin/mypaas
+curl -fLO https://github.com/hydroid7/mypaasr/releases/download/v0.1.0/mypaas_0.1.0_amd64.deb
+apt install ./mypaas_0.1.0_amd64.deb      # /usr/bin/mypaas; recommends Docker
 ```
+
+On any other x86_64 Linux, take the static binary, which runs whatever the
+glibc:
+
+```sh
+curl -fL https://github.com/hydroid7/mypaasr/releases/latest/download/mypaas-x86_64-linux -o /usr/local/bin/mypaas
+chmod +x /usr/local/bin/mypaas
+```
+
+Each release has a `SHA256SUMS` and build provenance, so you can check a
+download with `sha256sum -c SHA256SUMS --ignore-missing` or
+`gh attestation verify <file> --repo hydroid7/mypaasr`. To build both
+yourself, see [Development](#development). The client on your laptop is the
+same binary; on macOS or Windows, build it with `cargo build --release`.
+
+Upgrading with the `.deb` restarts the daemon and the socket proxy on the new
+binary; services and Traefik keep running. Removing it stops the daemon and
+leaves `~/_mypaas`, the containers and the unit files in place.
 
 On your laptop, create a key (or use an existing `~/.ssh/id_ed25519`) and
 print its public line:
@@ -459,6 +479,29 @@ The end-to-end tests start real daemons, socket proxies and Traefik
 containers. They need Docker and the `busybox:1.36` and `traefik:v3.7.17`
 images, use unique names and clean up after themselves.
 
+### Builds and releases
+
+```sh
+scripts/build-static.sh     # target-musl/x86_64-unknown-linux-musl/release/mypaas
+scripts/build-deb.sh        # target-deb/mypaas_<version>_amd64.deb
+```
+
+Both need only Docker on your machine. GitHub Actions runs
+[`ci.yml`](.github/workflows/ci.yml) on every push and pull request: clippy,
+the unit tests, the Docker end-to-end tests, and both builds with the `.deb`
+installed and removed on a clean Debian 13.
+
+To release, set `version` in `Cargo.toml`, commit, and push a matching tag:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+[`release.yml`](.github/workflows/release.yml) checks that the tag matches
+`Cargo.toml`, tests, builds, attests and publishes `mypaas-x86_64-linux`,
+`mypaas_<version>_amd64.deb` and `SHA256SUMS`. A tag with a hyphen
+(`v0.2.0-rc.1`) becomes a pre-release.
+
 ### Testing on a real systemd server, locally
 
 `scripts/vm-test.sh` boots a Debian 13 VM under QEMU/KVM and runs the whole
@@ -510,3 +553,7 @@ a full run on a local systemd VM. Still to do:
 
 Signing through `ssh-agent` is deliberately not supported: the client reads
 its key from a file or `MYPAAS_PRIVATE_KEY` and depends on nothing from SSH.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

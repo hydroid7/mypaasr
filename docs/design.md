@@ -97,6 +97,9 @@ process with a public port.
 
 The binary is statically linked (musl), so the server needs no language
 runtime. Docker, systemd and the Traefik image are the only dependencies.
+Releases on GitHub carry it as a plain file and as a `.deb` that installs
+`/usr/bin/mypaas` only; `server init` still writes the configuration and the
+units, so both install paths end in the same state.
 
 **State on the server**
 
@@ -721,6 +724,14 @@ Each entry: what was decided, and why.
   the shortest path from an SSRF bug to the cloud account.
 - **Pinned Traefik, by digest.** Upgrades are tested with the end-to-end suite
   and move with mypaas releases; a re-pushed tag changes nothing.
+- **A .deb that ships only the binary.** The units depend on the domain and
+  the config, which the package cannot know, so `server init` keeps writing
+  them. The package restarts the daemon and the proxy on upgrade and stops
+  them on removal, and leaves `~/_mypaas` and the containers alone.
+- **Releases are built by CI from a tag, with provenance.** The build job,
+  which runs the project's code, cannot write to the repository; a separate
+  job publishes. Each file has a SHA-256 and a GitHub build attestation, and
+  every third-party action is pinned by commit.
 
 ## Open questions
 

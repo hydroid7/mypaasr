@@ -58,13 +58,26 @@ mypaas secret set shop-web DB_PASSWORD      # hidden prompt, or pipe the value i
 
 ## 4. Get the binary into the job
 
-`mypaas` is one statically linked file with no runtime dependencies. There is
-no public release to download yet. Build it once with
-`scripts/build-static.sh` and put
-`target-musl/x86_64-unknown-linux-musl/release/mypaas` somewhere your CI can
-fetch it: a package registry, an object store or an internal URL. The examples
-below download it from `$MYPAAS_BIN_URL`, a CI variable you define. Pin the URL
-to a version, and check a SHA-256 if your registry provides one.
+`mypaas` is one statically linked file with no runtime dependencies. Each
+[GitHub release](https://github.com/hydroid7/mypaasr/releases) has it as
+`mypaas-x86_64-linux`, next to a `SHA256SUMS`. The examples below set
+`MYPAAS_VERSION` and check the download against the sums, so a job always
+gets the binary it was written for:
+
+```sh
+base=https://github.com/hydroid7/mypaasr/releases/download/v$MYPAAS_VERSION
+curl -fsSLO "$base/mypaas-x86_64-linux" -fsSLO "$base/SHA256SUMS"
+grep " mypaas-x86_64-linux$" SHA256SUMS | sha256sum -c -
+install -m 0755 mypaas-x86_64-linux /usr/local/bin/mypaas
+```
+
+To be stricter, pin the binary's hash in the pipeline instead of trusting the
+`SHA256SUMS` from the same release, or verify its build provenance with
+`gh attestation verify mypaas-x86_64-linux --repo hydroid7/mypaasr`.
+
+If your runners cannot reach GitHub, build the binary with
+`scripts/build-static.sh` and host
+`target-musl/x86_64-unknown-linux-musl/release/mypaas` somewhere they can.
 
 The client and the server don't need to be exactly the same version, but keep
 them close: the API is `/v1` and changes with mypaas releases.
@@ -107,7 +120,7 @@ Under Settings → Secrets and variables → Actions:
 
 - add a secret `MYPAAS_PRIVATE_KEY` with the full contents of `ci.key`,
   including the `BEGIN` and `END` lines,
-- add a variable `MYPAAS_BIN_URL`.
+- add a variable `MYPAAS_VERSION`, for example `0.1.0`.
 
 ```yaml
 # .github/workflows/deploy.yml
@@ -125,9 +138,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install mypaas
+        env:
+          MYPAAS_VERSION: ${{ vars.MYPAAS_VERSION }}
         run: |
-          curl -fsSL "${{ vars.MYPAAS_BIN_URL }}" -o /usr/local/bin/mypaas
-          chmod +x /usr/local/bin/mypaas
+          base=https://github.com/hydroid7/mypaasr/releases/download/v$MYPAAS_VERSION
+          curl -fsSLO "$base/mypaas-x86_64-linux" -fsSLO "$base/SHA256SUMS"
+          grep " mypaas-x86_64-linux$" SHA256SUMS | sha256sum -c -
+          sudo install -m 0755 mypaas-x86_64-linux /usr/local/bin/mypaas
           mypaas version
       - name: Deploy
         env:
@@ -151,7 +168,7 @@ CI/CD → Variables:
 
 - add `MYPAAS_KEY_FILE`, type **File**, **Protected**, with the contents of
   `ci.key`,
-- add `MYPAAS_BIN_URL`.
+- add `MYPAAS_VERSION`, for example `0.1.0`.
 
 ```yaml
 # .gitlab-ci.yml
@@ -165,7 +182,10 @@ deploy:
     MYPAAS_REMOTE: paas.example.com
   before_script:
     - apk add --no-cache curl
-    - curl -fsSL "$MYPAAS_BIN_URL" -o /usr/local/bin/mypaas && chmod +x /usr/local/bin/mypaas
+    - base=https://github.com/hydroid7/mypaasr/releases/download/v$MYPAAS_VERSION
+    - curl -fsSLO "$base/mypaas-x86_64-linux" -fsSLO "$base/SHA256SUMS"
+    - grep " mypaas-x86_64-linux$" SHA256SUMS | sha256sum -c -
+    - install -m 0755 mypaas-x86_64-linux /usr/local/bin/mypaas
   script:
     - export MYPAAS_PRIVATE_KEY="$(cat "$MYPAAS_KEY_FILE")"
     - mypaas push .

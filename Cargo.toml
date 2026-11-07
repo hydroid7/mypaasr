@@ -2,6 +2,9 @@
 name = "mypaas"
 version = "0.1.0"
 edition = "2024"
+description = "Single-server PaaS on Docker and Traefik"
+license = "MIT"
+repository = "https://github.com/hydroid7/mypaasr"
 
 [dependencies]
 anyhow = "1.0.104"
