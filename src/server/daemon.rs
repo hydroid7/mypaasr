@@ -726,17 +726,243 @@ mod tests {
     }
 
     fn signed(srv: &Server, method: &str, path: &str, body: &str, xff: &str) -> Vec<u8> {
-        let time = auth::unix_now();
+        signed_as(&srv.signing, &srv.key_id, method, path, body, xff, auth::unix_now())
+    }
+
+    fn signed_as(
+        key: &ed25519_dalek::SigningKey,
+        key_id: &str,
+        method: &str,
+        path: &str,
+        body: &str,
+        xff: &str,
+        time: u64,
+    ) -> Vec<u8> {
         let nonce = hex::encode(rand::random::<[u8; 16]>());
-        let sig = auth::sign(&srv.signing, &auth::canonical_string(method, path, time, &nonce, body.as_bytes()));
+        let sig = auth::sign(key, &auth::canonical_string(method, path, time, &nonce, body.as_bytes()));
         format!(
             "{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nX-Forwarded-For: {xff}\r\n\
-             X-Mypaas-Key: {}\r\nX-Mypaas-Time: {time}\r\nX-Mypaas-Nonce: {nonce}\r\nX-Mypaas-Sig: {sig}\r\n\
+             X-Mypaas-Key: {key_id}\r\nX-Mypaas-Time: {time}\r\nX-Mypaas-Nonce: {nonce}\r\nX-Mypaas-Sig: {sig}\r\n\
              Content-Length: {}\r\n\r\n{body}",
-            srv.key_id,
             body.len()
         )
         .into_bytes()
+    }
+
+    impl Server {
+        /// Authorizes another key and returns it with its id.
+        fn add_key(&self, scope: &str, expires: Option<&str>) -> (ed25519_dalek::SigningKey, String) {
+            let (signing, public) = test_key();
+            let mut line = format!("{} k{} scope={scope}", public.trim(), rand::random::<u32>());
+            if let Some(e) = expires {
+                line.push_str(&format!(" expires={e}"));
+            }
+            let key_id = auth::parse_authorized_line(&line).unwrap().key_id;
+            let path = self.state.paths.authorized_keys();
+            let mut text = std::fs::read_to_string(&path).unwrap();
+            text.push_str(&line);
+            text.push('\n');
+            std::fs::write(path, text).unwrap();
+            self.state.force_key_reload();
+            (signing, key_id)
+        }
+
+        async fn ticket(&self, service: &str, size: u64, sha256: &str, xff: &str) -> String {
+            let body = format!(r#"{{"service":"{service}","size":{size},"sha256":"{sha256}"}}"#);
+            let (status, text) = raw(self.addr, &signed(self, "POST", "/v1/deploy-tickets", &body, xff)).await;
+            assert_eq!(status, 200, "{text}");
+            json_body(&text)["ticket"].as_str().unwrap().to_string()
+        }
+    }
+
+    fn json_body(text: &str) -> serde_json::Value {
+        let body = &text[text.find("\r\n\r\n").expect("no body") + 4..];
+        serde_json::from_str(body.trim()).unwrap_or_else(|_| panic!("not JSON: {body}"))
+    }
+
+    fn put_upload(ticket: &str, body: &[u8]) -> Vec<u8> {
+        let mut req = format!(
+            "PUT /v1/deploy HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAuthorization: Bearer {ticket}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        req.extend_from_slice(body);
+        req
+    }
+
+    #[tokio::test]
+    async fn every_auth_failure_looks_the_same() {
+        let srv = start("read").await;
+        let (expired, expired_id) = srv.add_key("read", Some("2020-01-01"));
+        // A valid key that is simply not in authorized_keys.
+        let (unknown, unknown_public) = test_key();
+        let unknown_id = auth::parse_public_key(&unknown_public).unwrap().2;
+        let (out_of_scope, oos_id) = srv.add_key("deploy:other", None);
+        let now = auth::unix_now();
+        // A well-formed signature by the right key, but over a different request.
+        let good = String::from_utf8(signed(&srv, "GET", "/v1/services", "", "10.0.0.4")).unwrap();
+        let other_sig = auth::sign(&srv.signing, "mypaas/v1\nGET\n/v1/other\n0\n00\n00");
+        let start = good.find("X-Mypaas-Sig: ").unwrap() + 14;
+        let end = start + good[start..].find("\r\n").unwrap();
+        let bad_sig = format!("{}{other_sig}{}", &good[..start], &good[end..]).into_bytes();
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("unknown key", signed_as(&unknown, &unknown_id, "GET", "/v1/services", "", "10.0.0.1", now)),
+            ("expired key", signed_as(&expired, &expired_id, "GET", "/v1/services", "", "10.0.0.2", now)),
+            ("out of scope", signed_as(&out_of_scope, &oos_id, "GET", "/v1/services", "", "10.0.0.3", now)),
+            ("bad signature", bad_sig),
+            ("too old", signed_as(&srv.signing, &srv.key_id, "GET", "/v1/services", "", "10.0.0.5", now - 40)),
+            ("too new", signed_as(&srv.signing, &srv.key_id, "GET", "/v1/services", "", "10.0.0.6", now + 40)),
+            ("no headers", b"GET /v1/services HTTP/1.1\r\nHost: x\r\nConnection: close\r\nX-Forwarded-For: 10.0.0.7\r\n\r\n".to_vec()),
+        ];
+        for (what, req) in cases {
+            let (status, text) = raw(srv.addr, &req).await;
+            assert_eq!(status, 403, "{what}: {text}");
+            let mut body = json_body(&text);
+            assert!(body["server_time"].is_u64(), "{what}");
+            body.as_object_mut().unwrap().remove("server_time");
+            assert_eq!(body, serde_json::json!({ "error": "denied" }), "{what} must not reveal why");
+        }
+        // Inside the 30 second window is fine (kept clear of the edge, since a
+        // second may tick between signing and checking).
+        let ok = signed_as(&srv.signing, &srv.key_id, "GET", "/v1/secrets-free-route", "", "10.0.0.8", now - 25);
+        assert_eq!(raw(srv.addr, &ok).await.0, 404, "unknown paths stay 404");
+        let ok = signed_as(&srv.signing, &srv.key_id, "GET", "/v1/services/x/secrets", "", "10.0.0.8", now - 25);
+        assert_eq!(raw(srv.addr, &ok).await.0, 403, "read does not include secrets");
+        let (sk, id) = srv.add_key("secrets:x", None);
+        let ok = signed_as(&sk, &id, "GET", "/v1/services/x/secrets", "", "10.0.0.9", now + 25);
+        assert_eq!(raw(srv.addr, &ok).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn oversized_bundle_refused_at_the_ticket() {
+        let srv = start("deploy:*").await;
+        let max = ServerConfig::default().limits().unwrap().max_upload;
+        for size in [max + 1, 0] {
+            let body = format!(r#"{{"service":"app","size":{size},"sha256":"{}"}}"#, "a".repeat(64));
+            let (status, text) = raw(srv.addr, &signed(&srv, "POST", "/v1/deploy-tickets", &body, "1.2.3.4")).await;
+            assert_eq!(status, 413, "size {size}: {text}");
+        }
+        assert!(srv.ticket("app", max, &"a".repeat(64), "1.2.3.4").await.len() == 64);
+    }
+
+    #[tokio::test]
+    async fn busy_keeps_the_ticket_and_tickets_are_single_use() {
+        let srv = start("deploy:*").await;
+        let ticket = srv.ticket("app", 5, &"a".repeat(64), "2.3.4.5").await;
+        let lock = DeployLock::try_acquire(&srv.state.paths).unwrap().unwrap();
+        let (status, text) = raw(srv.addr, &put_upload(&ticket, b"12345")).await;
+        assert_eq!(status, 409, "{text}");
+        assert!(srv.state.guards().tickets.peek(&ticket, Instant::now()).is_some(), "busy must not burn the ticket");
+        drop(lock);
+        // Used once (the hash is wrong, so nothing is deployed)...
+        assert_eq!(raw(srv.addr, &put_upload(&ticket, b"12345")).await.0, 400);
+        // ...and never again.
+        assert_eq!(raw(srv.addr, &put_upload(&ticket, b"12345")).await.0, 403);
+    }
+
+    /// Step 7 of the deploy flow: a ticket for one service cannot deploy another,
+    /// even with a correct hash, because the Dockerfile's name is checked.
+    #[tokio::test]
+    async fn ticket_cannot_deploy_another_service() {
+        let srv = start("deploy:app").await;
+        let proj = tempfile::tempdir().unwrap();
+        std::fs::write(proj.path().join("Dockerfile"), "# mypaas.service=victim\nFROM busybox\n").unwrap();
+        let bundle = proj.path().join("b.tar.zst");
+        let packed = crate::bundle::pack(proj.path(), &proj.path().join("Dockerfile"), &bundle).unwrap();
+        let ticket = srv.ticket("app", packed.size, &packed.sha256, "3.4.5.6").await;
+        let (status, text) = raw(srv.addr, &put_upload(&ticket, &std::fs::read(&bundle).unwrap())).await;
+        assert_eq!(status, 200);
+        assert!(text.contains("names service \"victim\", but the ticket is for \"app\""), "{text}");
+        assert!(text.trim_end().trim_end_matches(['0', '\r', '\n']).ends_with("result: failed"), "{text}");
+        assert_eq!(std::fs::read_dir(srv.state.paths.tmp()).unwrap().count(), 0, "temp files are cleaned");
+    }
+
+    #[tokio::test]
+    async fn secret_values_are_write_only() {
+        let srv = start("secrets:app").await;
+        let value = "very-secret-value-123";
+        let (status, _) = raw(srv.addr, &signed(&srv, "PUT", "/v1/services/app/secrets/TOKEN", value, "4.5.6.7")).await;
+        assert_eq!(status, 200);
+        let (status, text) = raw(srv.addr, &signed(&srv, "GET", "/v1/services/app/secrets", "", "4.5.6.7")).await;
+        assert_eq!(status, 200);
+        assert_eq!(json_body(&text), serde_json::json!({ "names": ["TOKEN"] }));
+        assert!(!text.contains(value));
+        // Another service's secrets are out of this key's scope.
+        let (status, _) = raw(srv.addr, &signed(&srv, "GET", "/v1/services/other/secrets", "", "4.5.6.7")).await;
+        assert_eq!(status, 403);
+        let big = "x".repeat(api::MAX_SECRET_VALUE + 1);
+        let (status, _) = raw(srv.addr, &signed(&srv, "PUT", "/v1/services/app/secrets/BIG", &big, "4.5.6.7")).await;
+        assert_eq!(status, 413);
+    }
+
+    /// Every test in this binary logs into one shared buffer. A thread-local
+    /// subscriber misses events when tests run in parallel, because tracing
+    /// caches per-callsite interest globally.
+    fn captured_logs() -> Arc<Mutex<Vec<u8>>> {
+        static LOGS: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+        LOGS.get_or_init(|| {
+            #[derive(Clone)]
+            struct Buf(Arc<Mutex<Vec<u8>>>);
+            impl std::io::Write for Buf {
+                fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(b);
+                    Ok(b.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            let writer = Buf(buf.clone());
+            let _ = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .try_init();
+            buf
+        })
+        .clone()
+    }
+
+    /// The log records key, endpoint and outcome, never tickets or secret values.
+    #[tokio::test]
+    async fn logs_never_contain_tickets_or_secrets() {
+        let logs = captured_logs();
+        let srv = start("deploy:*,secrets:*").await;
+        let value = format!("do-not-log-{}", rand::random::<u64>());
+        raw(srv.addr, &signed(&srv, "PUT", "/v1/services/logtest/secrets/TOKEN", &value, "5.6.7.8")).await;
+        let ticket = srv.ticket("logtest", 5, &"a".repeat(64), "5.6.7.8").await;
+        raw(srv.addr, &put_upload(&ticket, b"12345")).await;
+        raw(srv.addr, &put_upload(&ticket, b"12345")).await;
+        let text = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
+        assert!(text.contains("/v1/services/logtest/secrets/TOKEN"), "the test must actually capture logs");
+        assert!(text.contains("unknown or expired ticket"), "the reused ticket must be logged as denied");
+        assert!(!text.contains(&value), "secret value logged");
+        assert!(!text.contains(&ticket), "ticket logged");
+    }
+
+    #[tokio::test]
+    async fn oversized_headers_refused() {
+        let srv = start("read").await;
+        let req = format!("GET /v1/services HTTP/1.1\r\nHost: x\r\nConnection: close\r\nX-Pad: {}\r\n\r\n", "a".repeat(9000));
+        assert_eq!(raw(srv.addr, req.as_bytes()).await.0, 431);
+    }
+
+    /// The real client's signing against the real daemon, including exit codes.
+    #[tokio::test]
+    async fn client_interoperates_with_daemon() {
+        let srv = start("secrets:app,logs").await;
+        let base = format!("http://{}", srv.addr);
+        let api = crate::client::Api::new(base.clone(), srv.signing.clone(), srv.key_id.clone()).unwrap();
+        api.signed(reqwest::Method::PUT, "/v1/services/app/secrets/A_B", b"v".to_vec()).await.unwrap();
+        let v: serde_json::Value = api.signed(reqwest::Method::GET, "/v1/services/app/secrets", Vec::new()).await.unwrap().json().await.unwrap();
+        assert_eq!(v["names"][0], "A_B");
+        // A signed query string must verify too.
+        let r = api.signed(reqwest::Method::GET, "/v1/services/app/logs?tail=5&since=10m", Vec::new()).await;
+        assert!(!matches!(r.as_ref().err().and_then(|e| e.downcast_ref::<crate::client::Exit>()), Some(x) if x.code == crate::client::EXIT_DENIED));
+        let stranger = crate::client::Api::new(base, test_key().0, srv.key_id.clone()).unwrap();
+        let err = stranger.signed(reqwest::Method::GET, "/v1/services/app/secrets", Vec::new()).await.unwrap_err();
+        assert_eq!(err.downcast_ref::<crate::client::Exit>().unwrap().code, crate::client::EXIT_DENIED);
     }
 
     #[tokio::test]
@@ -864,7 +1090,13 @@ mod tests {
         assert_eq!(route(&Method::GET, "/v1/services/a/logs"), Some(Route::Logs("a".into())));
         assert_eq!(route(&Method::PUT, "/v1/services/a/secrets/DB_PW"), Some(Route::SetSecret("a".into(), "DB_PW".into())));
         assert_eq!(route(&Method::PUT, "/v1/services/a/secrets/bad-name"), None);
-        assert_eq!(route(&Method::GET, "/v1/services/a/secrets/DB_PW"), None);
+        assert_eq!(route(&Method::GET, "/v1/services/a/secrets/DB_PW"), None, "secret values cannot be read");
+        // Keys are managed on the server only.
+        for path in ["/v1/keys", "/v1/authorized_keys", "/v1/keys/x"] {
+            for m in [Method::GET, Method::POST, Method::PUT, Method::DELETE] {
+                assert_eq!(route(&m, path), None);
+            }
+        }
     }
 
     #[test]

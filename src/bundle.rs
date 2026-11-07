@@ -292,11 +292,13 @@ mod tests {
         assert!(text.contains("a-prod"));
     }
 
-    /// Builds a raw tar.zst with hand-made headers, bypassing the tar crate's path checks.
+    /// Builds a raw tar.zst with hand-made GNU headers, bypassing the tar crate's
+    /// path checks. GNU format matters: only then are long names and PAX
+    /// headers applied by the reader.
     fn raw_bundle(entries: &[(&str, tar::EntryType, &[u8])]) -> tempfile::NamedTempFile {
         let mut data = Vec::new();
         for (name, kind, content) in entries {
-            let mut h = tar::Header::new_old();
+            let mut h = tar::Header::new_gnu();
             h.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
             h.set_entry_type(*kind);
             h.set_size(content.len() as u64);
@@ -334,6 +336,84 @@ mod tests {
         assert!(try_unpack(&[df, ("Dockerfile", Regular, b"again")], LIMITS).is_err());
         assert!(try_unpack(&[("other", Regular, b"x")], LIMITS).is_err());
         assert!(try_unpack(&[df, ("a/b/c/d/e/f/g/h/i", Regular, b"x")], LIMITS).is_err());
+    }
+
+    /// A PAX record: "<len> key=value\n", where len counts the whole record.
+    fn pax_record(key: &str, value: &str) -> Vec<u8> {
+        let body = format!(" {key}={value}\n");
+        let mut len = body.len() + 1;
+        while format!("{len}{body}").len() != len {
+            len += 1;
+        }
+        format!("{len}{body}").into_bytes()
+    }
+
+    /// Long names and PAX headers replace the short name in the header; the
+    /// checks must apply to the name the tar reader ends up using.
+    #[test]
+    fn rejects_traversal_through_extended_names() {
+        use tar::EntryType::*;
+        let df: (&str, tar::EntryType, &[u8]) = ("Dockerfile", Regular, b"FROM x");
+        let gnu = b"../../etc/evil\0".to_vec();
+        let err = try_unpack(&[df, ("././@LongLink", GNULongName, &gnu), ("innocent", Regular, b"x")], LIMITS).unwrap_err();
+        assert!(format!("{err:#}").contains(".."), "{err:#}");
+        let pax = pax_record("path", "/etc/evil");
+        let err = try_unpack(&[df, ("PaxHeader", XHeader, &pax), ("innocent", Regular, b"x")], LIMITS).unwrap_err();
+        assert!(format!("{err:#}").contains("absolute"), "{err:#}");
+        // A long name that is fine is accepted.
+        let long = format!("{}/file\0", "d".repeat(150));
+        assert!(try_unpack(&[df, ("././@LongLink", GNULongName, long.as_bytes()), ("short", Regular, b"x")], LIMITS).is_ok());
+        // A PAX link path cannot sneak in a symlink either.
+        let pax = pax_record("linkpath", "/etc");
+        assert!(try_unpack(&[df, ("PaxHeader", XHeader, &pax), ("l", Symlink, b"")], LIMITS).is_err());
+    }
+
+    /// Only the project's own .gitignore files count, so every machine packs the same bundle.
+    #[test]
+    fn packing_ignores_machine_specific_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let proj = root.path().join("proj");
+        std::fs::create_dir_all(proj.join(".git/info")).unwrap();
+        std::fs::create_dir_all(proj.join("sub")).unwrap();
+        std::fs::write(root.path().join(".gitignore"), "parent.txt\n").unwrap();
+        std::fs::write(proj.join(".git/info/exclude"), "excluded.txt\n").unwrap();
+        std::fs::write(proj.join("sub/.gitignore"), "*.tmp\n").unwrap();
+        for f in ["Dockerfile", "parent.txt", "excluded.txt", "a.tmp", "sub/a.tmp", "sub/keep.txt"] {
+            std::fs::write(proj.join(f), "x").unwrap();
+        }
+        let out = tempfile::tempdir().unwrap();
+        let p = pack(&proj, &proj.join("Dockerfile"), &out.path().join("b.tar.zst")).unwrap();
+        let names: Vec<&str> = p.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(names.contains(&"parent.txt"), "a .gitignore outside the project must not apply");
+        assert!(names.contains(&"excluded.txt"), ".git/info/exclude must not apply");
+        assert!(names.contains(&"a.tmp"), "sub/.gitignore applies to sub/ only");
+        assert!(!names.contains(&"sub/a.tmp"));
+        assert!(names.contains(&"sub/keep.txt"));
+        assert!(!names.iter().any(|n| n.starts_with(".git/")));
+    }
+
+    /// Same content gives the same hash, whatever the order files were created
+    /// in, their timestamps or their exact permission bits.
+    #[test]
+    fn hash_depends_on_content_only() {
+        let make = |order: &[&str], mode: u32, exec_mode: u32| {
+            let d = tempfile::tempdir().unwrap();
+            for f in order {
+                std::fs::create_dir_all(d.path().join(f).parent().unwrap()).unwrap();
+                std::fs::write(d.path().join(f), format!("content of {f}")).unwrap();
+                std::fs::set_permissions(d.path().join(f), std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+            std::fs::set_permissions(d.path().join("run.sh"), std::fs::Permissions::from_mode(exec_mode)).unwrap();
+            let out = d.path().join("..").join(format!("{}.tar.zst", rand::random::<u32>()));
+            let p = pack(d.path(), &d.path().join("Dockerfile"), &out).unwrap();
+            let _ = std::fs::remove_file(&out);
+            p.sha256
+        };
+        let a = make(&["Dockerfile", "src/a.py", "src/b.py", "run.sh"], 0o644, 0o755);
+        let b = make(&["run.sh", "src/b.py", "Dockerfile", "src/a.py"], 0o600, 0o700);
+        assert_eq!(a, b);
+        let c = make(&["Dockerfile", "src/a.py", "src/b.py", "run.sh"], 0o644, 0o644);
+        assert_ne!(a, c, "the exec bit is content: it changes the hash");
     }
 
     #[test]

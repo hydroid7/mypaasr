@@ -442,6 +442,23 @@ mod tests {
         assert!(resolve_host_volume(&paths, &cfg, allowed.join("link").to_str().unwrap()).is_err());
     }
 
+    /// A named volume always stays inside the service's own tree, even if
+    /// someone planted a symlink where its directory should be.
+    #[test]
+    fn named_volume_cannot_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { root: dir.path().join("_mypaas") };
+        let ok = resolve_named_volume(&paths, "shop", "data").unwrap();
+        assert!(ok.starts_with(std::fs::canonicalize(paths.volumes_dir().join("shop")).unwrap()));
+        let outside = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, paths.volumes_dir().join("shop/evil")).unwrap();
+        assert!(resolve_named_volume(&paths, "shop", "evil").is_err());
+        // Another service's volume is a different tree.
+        let other = resolve_named_volume(&paths, "blog", "data").unwrap();
+        assert_ne!(ok, other);
+    }
+
     #[test]
     fn default_config_roundtrip() {
         let cfg = ServerConfig::default();

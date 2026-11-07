@@ -715,6 +715,20 @@ mod tests {
         let s = parse_spec("# mypaas.service=a\n# mypaas.volume=data:/data\n").unwrap();
         let p = prepare(&paths, &cfg, &limits, &s, &user).unwrap();
         assert!(p.mounts[0].ends_with("volumes/a/data,target=/data"));
+
+        // A service reads only its own secrets: naming another service's key fails.
+        std::fs::write(paths.secrets_file("b"), "B_ONLY = \"x\"\n").unwrap();
+        let s = parse_spec("# mypaas.service=a\n# mypaas.env=B_ONLY\n").unwrap();
+        assert!(prepare(&paths, &cfg, &limits, &s, &admin).is_err(), "not even admin reads across services");
+
+        // Host paths need admin and the allowlist; admin alone is not enough.
+        let s = parse_spec(&format!("# mypaas.service=a\n# mypaas.volume={}:/h\n", dir.path().join("host").display())).unwrap();
+        assert!(prepare(&paths, &cfg, &limits, &s, &user).is_err());
+        let err = prepare(&paths, &cfg, &limits, &s, &admin).err().unwrap();
+        assert!(format!("{err:#}").contains("allow"), "{err:#}");
+        // cap_add needs admin.
+        let s = parse_spec("# mypaas.service=a\n# mypaas.cap_add=NET_ADMIN\n").unwrap();
+        assert!(prepare(&paths, &cfg, &limits, &s, &user).is_err());
     }
 
     #[test]
