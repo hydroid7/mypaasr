@@ -12,7 +12,8 @@ One binary does everything:
 - `mypaas server daemon` and `mypaas server socket-proxy` are started by systemd.
 
 The full design, including the threat model, is in
-[mypaas-rs Design Document.md](mypaas-rs%20Design%20Document.md).
+[docs/design.md](docs/design.md); deploying from CI is covered in
+[docs/ci.md](docs/ci.md).
 
 ## Contents
 
@@ -89,6 +90,11 @@ image on the server and streams the build and deploy log back. The last line is
 
 ## Configuring a service
 
+[examples/](examples/README.md) has complete services to start from: a static
+site, a web app with zero-downtime deploys, SQLite on a volume, staging and
+production from one project, a multi-stage Go build, a Redis worker and a
+shared Postgres.
+
 A service is one Dockerfile. A line counts as configuration when it starts with
 `#` followed by `mypaas.`, with spaces or tabs allowed around the `#`. Writing
 `#--- mypaas.url=` switches a line off. Unknown keys fail the deploy.
@@ -98,20 +104,20 @@ A service is one Dockerfile. A line counts as configuration when it starts with
 | `service` | Name of the service; a deploy replaces the service with this name. Required. | |
 | `url` | `http(s)://host[/path]`, repeatable. Without one the service is internal. | |
 | `port` | Port the process listens on inside the container | `80` |
-| `publish` | `[bind:]host:container[/udp]`, repeatable. Binds to `127.0.0.1` unless a bind address is given; a public bind needs `admin`. | |
 | `volume` | `name:/path[:ro]` or `/host/path:/path[:ro]`, repeatable | |
 | `env` | `KEY=value`, or `KEY` alone to take the value from the service's secrets | |
 | `scale` | `N` plus `roll` or `safe`; `0` means a single container | `0`, `roll` |
 | `healthcheck` | `/path interval timeout`, e.g. `/health 10s 2s`; used with `scale` above 0 | |
 | `maxcpu`, `maxmem` | Limits per container, within the server maximums | `1`, `512m` |
-| `network` | Shared network to join, repeatable; see [Shared networks](#shared-networks) | |
+| `network` | Shared network to join, created if missing, repeatable; see [Shared networks](#shared-networks) | |
 | `readonly` | `true` mounts the root filesystem read-only, with a tmpfs on `/tmp` | `false` |
 | `cap_add` | Linux capabilities to add back; needs `admin` | |
 
 ### Several instances of one project
 
 The identity of a deployment is `mypaas.service`, not the directory. Two
-Dockerfiles with different service names are independent deployments:
+Dockerfiles with different service names are independent deployments (see
+[examples/staging-prod](examples/staging-prod)):
 
 ```sh
 mypaas push Dockerfile.staging
@@ -130,9 +136,9 @@ stored as `Dockerfile`; a `.dockerignore` still applies to the build.
 mypaas push --dry-run           # file count, sizes and the ten largest files
 ```
 
-Bundles are limited to 50 MiB compressed and 200 MiB unpacked. The client
-warns above 20 MiB, since a stray binary is usually a missing `.gitignore`
-entry.
+Bundles are limited to 100 MiB compressed and 200 MiB unpacked by default
+(the server's `[limits]` decide). The client warns above 50 MiB and lists the
+largest files, since a stray binary is usually a missing `.gitignore` entry.
 
 ### Deploy strategies
 
@@ -182,21 +188,31 @@ root on the server can see them with `docker inspect`.
 ### Shared networks
 
 Every service runs on its own Docker network and can't reach any other
-service. To let several services share, for example, one Postgres, declare a
-network in the server's `config.toml` and list its members:
+service. To let several services share, for example, one Postgres, they all
+name the same network:
 
-```toml
-[networks.db]
-members = ["postgres", "shop-*", "blog"]
+```dockerfile
+# mypaas.network=db
 ```
 
-A service joins with `# mypaas.network=db` and is then reachable on that
-network by its service name. A service whose name doesn't match a member
-pattern is refused, so writing the same comment is not enough to get in.
+The network is created on the first deploy that names it, and each service on
+it is reachable there by its service name. Nothing is configured on the
+server, and any service may join, so the network is a convenience, not a
+security boundary: a service on it must check who connects, for example with
+one Postgres role and database per application.
+
+There are no host port mappings. Everything public goes through Traefik as
+HTTP or HTTPS; everything else is reached over a shared network.
 
 [examples/postgres](examples/postgres) is a complete setup: one Postgres
 shared by two apps, each with its own role and database, running with all
 capabilities dropped.
+
+### Single writer (SQLite and friends)
+
+The default, `scale=0`, stops the old container before it starts the new one,
+so two processes never open the same database file. With `scale` above 0 the
+replicas share their volumes, and the deploy warns if one of them is writable.
 
 ## Client commands
 
@@ -208,6 +224,7 @@ capabilities dropped.
 | `logs <service> [-f] [--tail N] [--since 10m] [--container N]` | `logs` | Container logs, merged across replicas |
 | `top` | `read` | Live view, refreshed every few seconds; `q` quits |
 | `stats <service> [--since 7d] [--by hour\|day]` | `read` | Requests, status classes, p50/p95 latency and a sparkline |
+| `dashboard [service] [--since 24h] [--watch]` | `read` | Uptime, memory and request history as terminal charts |
 | `rollback <service>` | `deploy` | Redeploy the previous version |
 | `rm <service>` | `rm` | Remove containers, networks, stored spec and stats; volumes and secrets stay |
 | `secret set\|ls\|rm <service> [KEY]` | `secrets` | Manage secrets |
@@ -217,8 +234,9 @@ capabilities dropped.
 
 Global options:
 
-- `-r <name>` picks a remote; a plain `https://domain` works too. With a
-  single remote it is the default, and `MYPAAS_REMOTE` overrides it.
+- `-r <name>` picks a remote; a domain (`paas.example.com` or
+  `https://paas.example.com`) works too. With a single remote it is the
+  default, and `MYPAAS_REMOTE` overrides it.
 - `--json` prints JSON, one object per line for streams.
 - `-q` prints only errors and results; `--no-color` turns off colour.
 
@@ -236,21 +254,11 @@ So CI can tell a bad key from a bad build.
 
 ### CI
 
-Create a passwordless key and give the server its public line:
+See [docs/ci.md](docs/ci.md) for keys, scopes and ready-to-use GitHub Actions
+and GitLab CI jobs. In short:
 
 ```sh
-mypaas key gen > ci.key           # the public line is printed on stderr
-```
-
-```sh
-# on the server
-mypaas server key add ci.pub --name ci --scope 'deploy:shop-*' --expires 2027-12-31
-```
-
-In the CI job, pass the private key in `MYPAAS_PRIVATE_KEY`:
-
-```sh
-MYPAAS_PRIVATE_KEY="$CI_KEY" mypaas -r https://paas.example.com push .
+MYPAAS_PRIVATE_KEY="$CI_KEY" mypaas -r paas.example.com push .
 ```
 
 ## Keys and scopes
@@ -276,7 +284,7 @@ ssh-ed25519 AAAA… ci scope=deploy:shop-*,read expires=2027-01-01
 | `deploy:<glob>` | `push` and `rollback` for matching services |
 | `secrets:<glob>` | `secret` for matching services |
 | `rm:<glob>` | `rm` for matching services |
-| `admin` | Everything, including public `publish`, `cap_add` and host-path volumes |
+| `admin` | Everything, including `cap_add` and host-path volumes |
 
 Keys are managed on the server only. The API has no endpoint for them, not
 even for `admin`:
@@ -296,7 +304,7 @@ Everything lives in `~/_mypaas`, which is also the only tree to back up:
 
 ```
 ~/_mypaas/
-  config.toml           settings, shared networks, volume allowlist
+  config.toml           settings, limits, volume allowlist
   authorized_keys       keys and scopes
   traefik.toml  staticroutes.toml  acme.json
   secrets/<service>.toml
@@ -311,7 +319,7 @@ Everything lives in `~/_mypaas`, which is also the only tree to back up:
 ### config.toml
 
 `config.toml` is read again at every deploy, so changes to `[defaults]`,
-`[networks]` and `[volumes]` need no restart. Changes to `[router]` and
+`[limits]`, `[maximums]` and `[volumes]` need no restart. Changes to `[router]` and
 `[stats]` take effect after `mypaas server restart all`. The defaults:
 
 ```toml
@@ -320,9 +328,9 @@ email = ""                      # Let's Encrypt account email, optional
 listen = "127.0.0.1:88"         # the daemon; must be a loopback address
 
 [limits]
-max_upload = "50m"
+max_upload = "100m"
 max_unpacked = "200m"
-max_files = 20000
+max_files = 40000
 max_depth = 32
 build_timeout = "15m"
 
@@ -337,15 +345,15 @@ log_max_file = 3
 cpu = 4.0
 mem = "4g"
 
-[networks.db]                   # shared networks, see above
-members = ["postgres", "shop-*"]
-
 [volumes]
 allow = ["/srv/media"]          # host paths admin deploys may mount
 chown = true                    # hand empty named volumes to the image's user
 
 [router]
 socket_proxy = true             # Traefik gets a read-only Docker socket
+read_timeout = "300s"           # longest request on :443, uploads included
+strict_sni = true               # refuse TLS for names without a certificate
+api_allow = []                  # e.g. ["203.0.113.0/24"]: only these reach the API
 
 [stats]
 enabled = true                  # Traefik writes an access log for `mypaas stats`
@@ -377,7 +385,43 @@ before they reach the disk. The daemon reads the log every 10 seconds into
 hourly buckets per service and keeps them for `retention_days`. The log is
 rotated at 32 MiB without losing lines.
 
+### Dashboard
+
+Once a minute the daemon also records, per service, whether its replicas are
+running and how much memory and CPU they use. `mypaas dashboard` shows it all
+in the terminal:
+
+```
+$ mypaas dashboard shop
+shop  healthy 2/2  last 24h by hour
+uptime 99.86%  requests 48210  5xx 0.02%  p95 41ms  mem peak 212.4 MiB
+
+requests  per hour
+  3.1k ┤                ▂▅▇█▆▃
+       ┤             ▁▅████████▅▂
+     0 ┤▁▁▁▂▂▃▄▅▆▇███████████████▃
+       └09:00    15:00    21:00    11-08
+
+memory  peak of all replicas
+  212M ┤        ▃▃▃▃▅▅▅▇▇▇███████
+    0B ┤▅▅▅▅▅▅▅▅████████████████████
+       └09:00    15:00    21:00    11-08
+
+uptime  worst part of each column
+99.86% │████████████████▃█████████
+█ all replicas up  ▆ some replicas down  ▃ partly down  ▁ down  · no data
+```
+
+Without a service name it shows one row per service with sparklines.
+`--since 7d` widens the window (hourly up to 14 days, daily beyond), `--watch`
+redraws full-screen every 10 seconds, and `--json` prints the data. Hours
+without samples, for example while the server was off, show as `·`, not as
+downtime.
+
 ## Security model
+
+The full review, the remaining risk and a checklist for the server's operator
+(host firewall, SSH, keys) are in [docs/security.md](docs/security.md).
 
 - **One public entry.** Traefik is the only process on a public port, and it
   forwards only `/v1/` on the admin domain to the daemon, which listens on
@@ -412,7 +456,7 @@ cargo clippy --all-targets
 ```
 
 The end-to-end tests start real daemons, socket proxies and Traefik
-containers. They need Docker and the `busybox:1.36` and `traefik:v3.6.1`
+containers. They need Docker and the `busybox:1.36` and `traefik:v3.7.17`
 images, use unique names and clean up after themselves.
 
 ### Testing on a real systemd server, locally
@@ -451,7 +495,7 @@ The source is laid out like this:
 | `src/server/guard.rs` | Backoff, nonces, tickets, rate limits |
 | `src/server/deploy.rs` | Builds, strategies, rollback, recovery |
 | `src/server/api.rs` | Services, status, logs, secrets |
-| `src/server/stats.rs` | Access log ingest and traffic buckets |
+| `src/server/stats.rs` | Access log ingest, usage samples and the hourly history buckets |
 | `src/server/sockproxy.rs` | Read-only Docker socket for Traefik |
 | `src/server/owner.rs` | Image user and volume ownership |
 | `src/server/setup.rs` | `server init`, keys, Traefik files, systemd units |
