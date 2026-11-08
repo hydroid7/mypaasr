@@ -946,8 +946,19 @@ mod tests {
         assert_eq!(status, 409, "{text}");
         assert!(srv.state.guards().tickets.peek(&ticket, Instant::now()).is_some(), "busy must not burn the ticket");
         drop(lock);
+        // A docker child spawned by a parallel test shares the flock until its
+        // exec closes the descriptor, so the lock can stay taken a moment
+        // longer. Busy keeps the ticket, so retrying is safe.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            let status = raw(srv.addr, &put_upload(&ticket, b"12345")).await.0;
+            if status != 409 || Instant::now() > deadline {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
         // Used once (the hash is wrong, so nothing is deployed)...
-        assert_eq!(raw(srv.addr, &put_upload(&ticket, b"12345")).await.0, 400);
+        assert_eq!(status, 400);
         // ...and never again.
         assert_eq!(raw(srv.addr, &put_upload(&ticket, b"12345")).await.0, 403);
     }
