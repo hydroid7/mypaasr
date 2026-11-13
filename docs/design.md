@@ -552,11 +552,21 @@ failed deploy restores the previous spec.
 
 Addresses: the library follows the interfaces and rechecks them every 30
 seconds, so a DHCP change moves the address records. Both A and AAAA records
-are published, including link-local IPv6 addresses: resolvers ask for both at
-once, and when nothing answers the AAAA query on IPv6 a lookup stalls for about
-5 seconds (measured in the spike with nss-mdns and Avahi). Publishing IPv4 only
-while listening on IPv6 made lookups fail outright, so it is not an option.
-Clients may therefore connect over IPv6; Traefik listens on both families.
+are published: resolvers ask for both at once, and when nothing answers the
+AAAA query on IPv6 a lookup stalls for about 5 seconds (measured in the spike
+with nss-mdns and Avahi). Publishing IPv4 only while listening on IPv6 made
+lookups fail outright, so it is not an option. Clients may therefore connect
+over IPv6; Traefik listens on both families.
+
+The AAAA records carry only link-local and unique local (`fc00::/7`) addresses,
+never global ones. A client that connects to a global address comes from its
+own global address, and on most home connections the ISP changes that prefix
+at reconnects. `router.api_allow` could not list it, so the admin API would
+refuse a client or not depending on which record it picked (seen on the first
+real install, 2026-11-13). With global addresses left out, a client arrives
+from an IPv4 address or the LAN's unique local prefix, and both stay put. A LAN
+with no unique local prefix gets link-local AAAA records only, and clients fall
+back to IPv4.
 
 If another device already holds a name, the library would rename this one
 (`shop-2.local`). Traefik routes by the exact `Host`, so mypaas treats a rename
@@ -891,6 +901,12 @@ Each entry: what was decided, and why.
   mDNS does not resolve them; multi-subnet operation is left out. AAAA records
   are published as well, because without them every lookup waits about 5 s for
   the AAAA query to time out (spike, 2026-11-13).
+- **No global IPv6 addresses in AAAA records.** Only link-local and unique
+  local ones. A global address makes the client connect from its own global
+  address, whose ISP-assigned prefix changes, so `router.api_allow` cannot
+  cover it and admin access depended on which record the client chose (first
+  install, 2026-11-13). Cost: a LAN without a unique local prefix reaches the
+  server over IPv4 only.
 - **Both switches, and off means off.** The Cargo feature removes the code, and
   `lan.enabled` removes the behaviour; a build without the feature refuses an
   enabled config rather than ignoring it.

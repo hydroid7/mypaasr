@@ -3,6 +3,7 @@
 //! The library runs its own thread and probes before announcing (RFC 6762).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 
 use anyhow::{Context, Result};
 use mdns_sd::{DaemonEvent, IfKind, IfPredicate, ServiceDaemon, ServiceInfo};
@@ -25,6 +26,18 @@ fn is_docker_interface(name: &str) -> bool {
     name == "docker0" || name.starts_with("br-") || name.starts_with("veth") || name.starts_with("docker")
 }
 
+/// Global IPv6 addresses are left out. A client that connects to one comes
+/// from its own global address, whose prefix the ISP may change at any
+/// reconnect, so `router.api_allow` cannot list it and the admin API refuses
+/// the client depending on which AAAA record it picked. Link-local and unique
+/// local (fc00::/7) addresses stay, so AAAA queries are still answered.
+fn is_announced_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(_) => true,
+        IpAddr::V6(v6) => v6.is_unicast_link_local() || v6.is_unique_local(),
+    }
+}
+
 impl MdnsAnnouncer {
     pub fn new(interfaces: &[String]) -> Result<Self> {
         let daemon = ServiceDaemon::new().context("cannot start the mDNS responder")?;
@@ -39,6 +52,9 @@ impl MdnsAnnouncer {
             let wanted = interfaces.to_vec();
             daemon.disable_interface(IfKind::Predicate(IfPredicate::new(move |i| !wanted.contains(&i.name))))?;
         }
+        // The library sees one entry per address, so this drops single
+        // addresses, not interfaces; the 30 s recheck applies it to new ones.
+        daemon.disable_interface(IfKind::Predicate(IfPredicate::new(|i| !is_announced_ip(i.ip()))))?;
         // Follow DHCP changes; the A records are rewritten from the new addresses.
         daemon.set_ip_check_interval(30)?;
         let events = daemon.monitor()?;
@@ -125,5 +141,20 @@ impl Drop for MdnsAnnouncer {
         if let Ok(rx) = self.daemon.shutdown() {
             let _ = rx.recv_timeout(std::time::Duration::from_secs(2));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_lan_scoped_ipv6_addresses_are_announced() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(is_announced_ip(ip("192.168.178.115")));
+        assert!(is_announced_ip(ip("fd9f:877c:6913:0:9eda:3eff:fef7:2e39")));
+        assert!(is_announced_ip(ip("fe80::51bf:49f5:4586:c81d")));
+        assert!(!is_announced_ip(ip("2003:d3:9f21:900:9eda:3eff:fef7:2e39")));
+        assert!(!is_announced_ip(ip("::1")));
     }
 }

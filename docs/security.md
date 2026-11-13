@@ -187,8 +187,10 @@ harden:
     accept 80 only from the LAN, if the server runs `plain_admin`. A server with
     public `http://` services on port 80 needs a `router.api_allow` for the
     admin name, because Traefik routes by name.
-11. **LAN mode: set `router.api_allow`** to your LAN's network, for example
-    `["192.168.1.0/24"]`, then run `mypaas server restart router`. Traefik then
+11. **LAN mode: set `router.api_allow`** to your LAN's networks, for example
+    `["192.168.1.0/24", "fd12:3456:789a::/64"]` (the IPv4 range and, if the LAN
+    has one, its unique local IPv6 prefix, since names get AAAA records for
+    it), then run `mypaas server restart router`. Traefik then
     answers everyone else with 403. Without it, `server init` and the daemon
     warn.
 12. **LAN mode: use `--plain-secrets` knowingly.** It sends a secret value over

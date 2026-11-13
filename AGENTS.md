@@ -124,7 +124,10 @@ without an explicit decision recorded in the design document.
   fake `Announcer` in `announce.rs`; only `mdns.rs` touches the network.
 - Names get A and AAAA records. Publishing IPv4 only made dual-stack lookups
   stall for about 5 s, or fail when IPv6 stayed open (spike, see
-  docs/design.md). Do not disable IPv6 in `mdns.rs` without re-testing with
+  docs/design.md). Global IPv6 addresses are left out of the AAAA records on
+  purpose (their prefix changes, so `api_allow` cannot cover clients that use
+  them); only link-local and unique local ones are published. Do not disable
+  IPv6 in `mdns.rs` without re-testing with
   `getent hosts` and `avahi-resolve`.
 - To try it locally: `MYPAAS_HOME=/tmp/x mypaas server init --lan --domain
   paas-test.local`, set `listen` to a free loopback port, run

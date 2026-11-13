@@ -479,8 +479,11 @@ network (and subnet) as the devices that will use it. Install mypaas as in
 - The admin name you pick is not the machine's own hostname. If the machine is
   called `nas`, Avahi already announces `nas.local`; use `paas.local` instead.
   A running `avahi-daemon` is fine otherwise.
-- Find your LAN's address range, for example with `ip -4 addr` (an address
-  `192.168.1.20/24` means the range `192.168.1.0/24`).
+- Find your LAN's address ranges, for example with `ip addr` (an address
+  `192.168.1.20/24` means the range `192.168.1.0/24`). If the machine also has
+  an IPv6 address starting with `fd` (a unique local address, which most home
+  routers hand out), its first four groups give the second range, for example
+  `fd12:3456:789a::/64`. Clients may connect over it.
 
 **2. Create your key** on your laptop, as in the Quick start:
 
@@ -502,7 +505,7 @@ the user that ran `init`, normally `/root/_mypaas/config.toml`):
 
 ```toml
 [router]
-api_allow = ["192.168.1.0/24"]  # your LAN's range from step 1
+api_allow = ["192.168.1.0/24", "fd12:3456:789a::/64"]  # your LAN's ranges from step 1
 ```
 
 Then write the files again and start everything:
@@ -632,7 +635,7 @@ Then restrict the admin API to your network. In `config.toml`:
 
 ```toml
 [router]
-api_allow = ["192.168.1.0/24"]  # your LAN's address range
+api_allow = ["192.168.1.0/24", "fd12:3456:789a::/64"]  # your LAN's IPv4 and unique local IPv6 ranges
 ```
 
 and run `mypaas server restart all`. Traefik answers everyone else with 403.
@@ -667,7 +670,9 @@ Known limits:
   machine (hence the reserved `<hostname>.local`).
 
 Not in this version: HTTPS for `.local` names and mDNS across subnets. Names
-get AAAA records too (link-local included), so clients may connect over IPv6.
+get AAAA records too, so clients may connect over IPv6. Only link-local and
+unique local (`fd…`) addresses are announced, never global ones, so a client
+always arrives from your IPv4 range or your unique local prefix.
 
 ## Security model
 
