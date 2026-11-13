@@ -1,0 +1,66 @@
+# Written by mypaas server init; changes are overwritten.
+
+[log]
+level = "WARN"
+
+[entryPoints.web]
+address = ":80"
+
+[entryPoints.web.transport.respondingTimeouts]
+readTimeout = "60s"
+idleTimeout = "60s"
+
+[entryPoints.web.http]
+maxHeaderBytes = 32768
+
+[entryPoints.web-secure]
+address = ":443"
+
+# Traefik has no separate header timeout, so readTimeout also limits how long
+# a client may trickle headers. It must fit the largest upload; see
+# router.read_timeout in config.toml.
+[entryPoints.web-secure.transport.respondingTimeouts]
+readTimeout = "300s"
+idleTimeout = "60s"
+
+[entryPoints.web-secure.http]
+maxHeaderBytes = 32768
+
+[entryPoints.web-secure.http2]
+maxConcurrentStreams = 100
+
+[providers.docker]
+# Read-only access through `mypaas server socket-proxy`.
+endpoint = "unix:///mypaas-run/docker.sock"
+exposedByDefault = false
+watch = true
+
+[providers.file]
+filename = "/staticroutes.toml"
+watch = true
+
+[certificatesResolvers.default.acme]
+email = "a@b.c"
+storage = "/acme.json"
+keyType = "EC256"
+
+[certificatesResolvers.default.acme.httpChallenge]
+entryPoint = "web"
+
+# Only what the traffic stats need: no client addresses, paths or headers.
+[accessLog]
+filePath = "/mypaas-logs/access.log"
+format = "json"
+bufferingSize = 100
+
+[accessLog.fields]
+defaultMode = "drop"
+
+[accessLog.fields.names]
+ServiceName = "keep"
+DownstreamStatus = "keep"
+Duration = "keep"
+StartUTC = "keep"
+
+[accessLog.fields.headers]
+defaultMode = "drop"

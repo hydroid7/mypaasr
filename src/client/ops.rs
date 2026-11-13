@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use reqwest::Method;
 use serde_json::Value;
 
-use super::{Api, BOLD, DIM, EXIT_DENIED, EXIT_ERROR, GREEN, Output, RED, YELLOW, exit, human, paint};
+use super::{Api, BOLD, DIM, EXIT_DENIED, EXIT_ERROR, EXIT_USAGE, GREEN, Output, RED, YELLOW, exit, human, paint};
 use crate::auth;
 use crate::spec::{is_valid_env_name, is_valid_name, parse_duration_ms};
 
@@ -77,6 +77,21 @@ fn service_table(v: &Value, out: Output) -> Vec<String> {
     lines
 }
 
+/// One LAN name and its announce state. A conflict or an error is a red
+/// `warning:` line, since this server does not serve that name then.
+fn lan_line(out: Output, host: &str, state: &str) -> String {
+    if state.starts_with("CONFLICT") || state.starts_with("error") {
+        paint(out, RED, &format!("warning: {host}: {state}; this server does not answer to that name"))
+    } else {
+        format!("{host}: {state}")
+    }
+}
+
+/// The LAN names of a service (`lan` in the server's JSON), in host order.
+fn lan_lines(out: Output, s: &Value) -> Vec<String> {
+    s["lan"].as_object().into_iter().flatten().map(|(host, state)| lan_line(out, host, state.as_str().unwrap_or("?"))).collect()
+}
+
 pub async fn ls(remote: Option<&str>, out: Output) -> Result<()> {
     let api = Api::connect(remote)?;
     let v: Value = api.signed(Method::GET, "/v1/services", Vec::new()).await?.json().await?;
@@ -85,6 +100,14 @@ pub async fn ls(remote: Option<&str>, out: Output) -> Result<()> {
     } else {
         for l in service_table(&v, out) {
             println!("{l}");
+        }
+        let lan: Vec<String> = v["services"].as_array().into_iter().flatten().flat_map(|s| lan_lines(out, s)).collect();
+        if !lan.is_empty() {
+            println!();
+            println!("{}", paint(out, BOLD, "LAN NAMES"));
+            for l in lan {
+                println!("{l}");
+            }
         }
     }
     Ok(())
@@ -110,6 +133,10 @@ pub async fn status(remote: Option<&str>, service: &str, out: Output) -> Result<
     let health = v["health"].as_str().unwrap_or("?");
     row("service", v["service"].as_str().unwrap_or(service).to_string());
     row("urls", strs("urls"));
+    let lan = lan_lines(out, &v);
+    if !lan.is_empty() {
+        row("lan", lan.join("\n            "));
+    }
     let mode = if v["scale"].as_u64() == Some(0) { "single".to_string() } else { v["strategy"].as_str().unwrap_or("?").to_string() };
     row("replicas", format!("{}/{} ({mode}), {}", v["running"], v["wanted"], paint(out, health_color(health), health)));
     row("port", v["port"].to_string());
@@ -451,10 +478,25 @@ fn check_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn secret_set(remote: Option<&str>, service: &str, key: &str, out: Output) -> Result<()> {
+/// A secret value over plain HTTP is readable on the LAN, so it is sent only
+/// when the user asked for that. Checked before the value is read.
+fn check_secret_transport(base: &str, plain_secrets: bool) -> Result<()> {
+    if super::is_plain_lan_remote(base) && !plain_secrets {
+        return Err(exit(
+            EXIT_USAGE,
+            "this remote is plain HTTP: the secret value would cross the LAN unencrypted; pass --plain-secrets to send it anyway",
+        ));
+    }
+    Ok(())
+}
+
+pub async fn secret_set(remote: Option<&str>, service: &str, key: &str, plain_secrets: bool, out: Output) -> Result<()> {
     check_service(service)?;
     check_key(key)?;
-    let api = Api::connect(remote)?;
+    let base = super::resolve_remote(remote)?;
+    check_secret_transport(&base, plain_secrets)?;
+    let (signing, key_id) = super::load_signing_key()?;
+    let api = Api::new(base, signing, key_id)?;
     let value = read_secret_value(key)?;
     api.signed(Method::PUT, &format!("/v1/services/{service}/secrets/{key}"), value.into_bytes()).await?;
     if !out.quiet {
@@ -536,6 +578,14 @@ async fn doctor_checks(remote: Option<&str>, checks: &mut Vec<Check>, code: &mut
         }
     };
     checks.push(Check { name: "remote", ok: true, detail: base.clone() });
+    if super::is_plain_lan_remote(&base) {
+        // Same shape as the clock warning: the check passes, the detail says what is wrong.
+        checks.push(Check {
+            name: "tls",
+            ok: true,
+            detail: "warning: plain HTTP, the connection is not encrypted; secrets, logs and bundles are readable on the LAN".into(),
+        });
+    }
     let api = Api::new(base.clone(), key, key_id.clone())?;
     let resp = match api.send_signed(Method::GET, "/v1/services", Vec::new()).await {
         Ok(r) => r,
@@ -603,6 +653,28 @@ mod tests {
         assert!(lines[1].contains("shop") && lines[1].contains("2/2") && lines[1].contains("1.2%") && lines[1].contains("1.0 MiB"));
         assert!(lines[1].contains("1234"));
         assert!(!lines[1].contains('\x1b'));
+    }
+
+    #[test]
+    fn lan_names_show_conflicts_loudly() {
+        let v = serde_json::json!({ "service": "shop", "lan": {
+            "shop.local": "announced",
+            "printer.local": "CONFLICT: name in use by another device",
+        }});
+        let lines = lan_lines(Output::default(), &v);
+        assert_eq!(lines.len(), 2);
+        assert!(lines.contains(&"shop.local: announced".to_string()));
+        assert!(lines.contains(&"warning: printer.local: CONFLICT: name in use by another device; this server does not answer to that name".to_string()));
+        assert!(lan_lines(Output::default(), &serde_json::json!({ "service": "x" })).is_empty());
+    }
+
+    #[test]
+    fn secrets_stay_off_plain_http_unless_asked() {
+        assert!(check_secret_transport("https://paas.example.com", false).is_ok());
+        assert!(check_secret_transport("http://127.0.0.1:88", false).is_ok());
+        let err = check_secret_transport("http://paas.local", false).unwrap_err();
+        assert_eq!(err.downcast_ref::<crate::client::Exit>().unwrap().code, 2);
+        assert!(check_secret_transport("http://paas.local", true).is_ok());
     }
 
     #[test]

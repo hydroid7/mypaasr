@@ -22,6 +22,7 @@ The full design, including the threat model, is in
 - [Client commands](#client-commands)
 - [Keys and scopes](#keys-and-scopes)
 - [Server](#server)
+- [LAN mode](#lan-mode)
 - [Security model](#security-model)
 - [Development](#development)
 - [Status](#status)
@@ -340,7 +341,9 @@ Everything lives in `~/_mypaas`, which is also the only tree to back up:
 
 `config.toml` is read again at every deploy, so changes to `[defaults]`,
 `[limits]`, `[maximums]` and `[volumes]` need no restart. Changes to `[router]` and
-`[stats]` take effect after `mypaas server restart all`. The defaults:
+`[stats]` take effect after `mypaas server restart all`. Changes to `[lan]`
+take effect after `mypaas server init` and `mypaas server restart all`. The
+defaults:
 
 ```toml
 domain = "paas.example.com"
@@ -378,6 +381,12 @@ api_allow = []                  # e.g. ["203.0.113.0/24"]: only these reach the 
 [stats]
 enabled = true                  # Traefik writes an access log for `mypaas stats`
 retention_days = 90
+
+[lan]                           # see LAN mode; the release binaries have it
+enabled = false
+interfaces = []                 # empty: every up, non-loopback, non-Docker interface
+allow = ["*.local"]             # names services may claim
+plain_admin = false             # admin API over plain HTTP; see LAN mode
 ```
 
 The server refuses to start if a `volumes.allow` entry overlaps `/`,
@@ -387,7 +396,7 @@ The server refuses to start if a `volumes.allow` entry overlaps `/`,
 
 | Command | What it does |
 | --- | --- |
-| `server init [--domain D] [--email E] [--key FILE]` | Create `~/_mypaas`, the Traefik files and the systemd units |
+| `server init [--domain D] [--email E] [--key FILE] [--lan]` | Create `~/_mypaas`, the Traefik files and the systemd units; `--lan` turns on [LAN mode](#lan-mode) |
 | `server restart all\|daemon\|router` | Restart the daemon (`mypaasd`), or the socket proxy and Traefik, or everything |
 | `server deploy DIR` | Deploy a local directory as admin, through the same code as the API; for debugging |
 | `server key add\|ls\|rm` | Manage `authorized_keys` |
@@ -438,6 +447,228 @@ redraws full-screen every 10 seconds, and `--json` prints the data. Hours
 without samples, for example while the server was off, show as `·`, not as
 downtime.
 
+## LAN mode
+
+LAN mode lets devices on the same local network open a service by a `.local`
+name, such as `http://shop.local`, with no DNS server and no hosts-file edits.
+It is off by default, and it changes nothing for public URLs.
+
+There are two ways to use it:
+
+- **Public server with LAN names**: the admin API stays on HTTPS under a
+  public domain, and services may add `.local` URLs. See
+  [Turn it on](#turn-it-on).
+- **LAN-only server**: no public domain at all, for a home server or a lab.
+  The admin API is reached over plain HTTP on the LAN. See the walkthrough
+  below.
+
+### Walkthrough: set up a LAN-only server
+
+This sets up a server that is reachable only on your local network, as
+`paas.local`, with services such as `http://lan-app.local`.
+
+**1. Prepare the machine.** You need Linux with Docker and systemd on the same
+network (and subnet) as the devices that will use it. Install mypaas as in
+[Quick start](#1-prepare-the-server). Check that:
+
+- TCP port 80 is free and reachable from the LAN. Port 443 is not used for
+  `.local` names, but Traefik still listens on it.
+- UDP port 5353 (mDNS) is allowed in from the LAN by the host firewall. With
+  `ufw`: `ufw allow from 192.168.1.0/24 to any port 5353 proto udp` and
+  `ufw allow from 192.168.1.0/24 to any port 80 proto tcp`.
+- The admin name you pick is not the machine's own hostname. If the machine is
+  called `nas`, Avahi already announces `nas.local`; use `paas.local` instead.
+  A running `avahi-daemon` is fine otherwise.
+- Find your LAN's address range, for example with `ip -4 addr` (an address
+  `192.168.1.20/24` means the range `192.168.1.0/24`).
+
+**2. Create your key** on your laptop, as in the Quick start:
+
+```sh
+mypaas key init
+mypaas key show > mykey.pub     # copy this file to the server
+```
+
+**3. Initialize the server** as root. `--lan` with a `.local` domain turns on
+LAN mode and the plain-HTTP admin API; it prints a warning about what that
+means. No Let's Encrypt account is needed, so skip the email:
+
+```sh
+mypaas server init --domain paas.local --lan --email "" --key mykey.pub
+```
+
+**4. Restrict the admin API to your LAN.** Edit `~/_mypaas/config.toml` (of
+the user that ran `init`, normally `/root/_mypaas/config.toml`):
+
+```toml
+[router]
+api_allow = ["192.168.1.0/24"]  # your LAN's range from step 1
+```
+
+Then write the files again and start everything:
+
+```sh
+mypaas server init --domain paas.local --email ""   # keeps [lan]; rewrites Traefik files
+mypaas server restart all
+```
+
+**5. Check name resolution** from another machine on the LAN:
+
+```sh
+avahi-resolve -4 -n paas.local  # Linux; on macOS: dns-sd -G v4 paas.local
+ping paas.local
+```
+
+If it does not resolve, see [Client support](#client-support) and the
+firewall step above.
+
+**6. Connect the client** on your laptop. The `http://` is required:
+
+```sh
+mypaas remote add lan http://paas.local
+mypaas -r lan doctor            # warns that the connection is not encrypted
+```
+
+**7. Deploy a service** with a `.local` URL, for example
+[examples/lan-app](examples/lan-app):
+
+```sh
+mypaas -r lan push examples/lan-app
+mypaas -r lan ls                # shows lan-app.local as announced
+```
+
+Open `http://lan-app.local` from any device on the network. Secrets need the
+extra flag, because they cross the LAN unencrypted:
+
+```sh
+mypaas -r lan secret set lan-app API_TOKEN --plain-secrets
+```
+
+Do not forward port 80 from your internet router to this server: the admin API
+is on that port. Read [docs/security.md](docs/security.md#lan-mode) for what
+plain HTTP exposes. Later changes to `[lan]` take effect after
+`mypaas server init` and `mypaas server restart all`.
+
+### Turn it on
+
+On the server, as root:
+
+```sh
+mypaas server init --lan          # sets [lan] enabled = true, rewrites the units
+mypaas server restart all
+```
+
+You can also set `enabled = true` under `[lan]` in `config.toml` and run the
+same two commands. The release binaries and the `.deb` include LAN mode. A
+binary built with `--no-default-features` does not; it refuses to load a config
+that enables it.
+
+### Name a service
+
+Use the `url` key with `http://` and a `.local` host:
+
+```dockerfile
+# mypaas.service=lan-app
+# mypaas.url=http://lan-app.local
+# mypaas.port=8080
+```
+
+[examples/lan-app](examples/lan-app) is a complete one. After `mypaas push`,
+open `http://lan-app.local` from any device on the same network.
+
+- Only `.local` names are announced. `https://….local` is refused at deploy,
+  because there is no certificate for these names yet.
+- A name with more than one label before `.local`, such as `api.shop.local`, is
+  accepted with a warning. Some clients only resolve `name.local`.
+- `allow` in `[lan]` limits which names may be claimed. It is `["*.local"]` by
+  default.
+- If another device already has the name, mypaas does not announce it, and
+  `mypaas ls` and `status` show `conflict`. Other states are `announced` and
+  `error`.
+- A name is announced while its service is deployed, even if its containers are
+  down. Removing the service (`rm`) withdraws it.
+- Changes take effect within a few seconds of a deploy, rollback or removal.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Turns LAN mode on |
+| `interfaces` | `[]` | Network interfaces to announce on. Empty means every up, non-loopback, non-Docker interface. |
+| `allow` | `["*.local"]` | Globs of names services may claim |
+| `plain_admin` | `false` | Serves the admin API over plain HTTP; see below |
+
+### Manage the server from the LAN (plain HTTP)
+
+A server with no public domain can be run from the LAN without an SSH tunnel
+or a certificate. Its admin domain must be a `.local` name:
+
+```sh
+mypaas server init --domain paas.local --lan --key mykey.pub     # prints a warning
+mypaas server restart all
+```
+
+This sends the admin API over plain HTTP. Anyone on the same network can read
+the traffic, including secret values, logs and bundles, and anyone who wins the
+name `paas.local` on that network receives your requests. Keys still protect
+requests from being forged, but nothing protects them from being read. Read
+[docs/security.md](docs/security.md#lan-mode) before you use it.
+
+On your laptop, add the remote with an explicit `http://`:
+
+```sh
+mypaas remote add lan http://paas.local
+mypaas -r lan doctor            # warns that the connection is not encrypted
+mypaas -r lan push .
+```
+
+A bare `paas.local` stays HTTPS, so the scheme is always visible in the remote.
+`secret set` refuses to send a value over this remote unless you pass
+`--plain-secrets`:
+
+```sh
+mypaas -r lan secret set shop API_TOKEN --plain-secrets
+```
+
+Then restrict the admin API to your network. In `config.toml`:
+
+```toml
+[router]
+api_allow = ["192.168.1.0/24"]  # your LAN's address range
+```
+
+and run `mypaas server restart all`. Traefik answers everyone else with 403.
+`server init` and the daemon warn when `plain_admin` is on and `api_allow` is
+empty. Never forward port 80 from your router to a server that runs
+`plain_admin`.
+
+### Client support
+
+Announcing a name is not the same as a device resolving it:
+
+- Apple devices (macOS, iOS) resolve `.local` names.
+- Linux needs mDNS in name resolution: nss-mdns, or systemd-resolved with mDNS
+  turned on. The default nss-mdns setup handles only `name.local` names.
+- Windows and Android depend on the version and the browser. Android browsers
+  often do not resolve `.local` names at all. Check the devices you use.
+- Wi-Fi access points and VLANs can filter multicast, and client isolation
+  stops devices from seeing each other. mDNS does not cross subnets.
+- A host running `avahi-daemon` also uses UDP port 5353. It coexists with mypaas.
+  The server's own `<hostname>.local`, which Avahi announces, is reserved: in
+  the spike a name claimed by both mypaas and Avahi on the same machine was not
+  reported as a conflict. The server must let UDP 5353 through on the LAN side.
+
+Known limits:
+
+- A name is announced while its service's spec is on disk, even if the
+  containers are down.
+- Stopping or restarting the daemon does not send goodbye packets, so other
+  devices may keep a name cached for up to two minutes. A restart announces the
+  same names again; `mypaas rm` withdraws a name at once.
+- Conflicts are detected against other devices, not against Avahi on the same
+  machine (hence the reserved `<hostname>.local`).
+
+Not in this version: HTTPS for `.local` names and mDNS across subnets. Names
+get AAAA records too (link-local included), so clients may connect over IPv6.
+
 ## Security model
 
 The full review, the remaining risk and a checklist for the server's operator
@@ -463,6 +694,9 @@ The full review, the remaining risk and a checklist for the server's operator
   the secrets, from what it returns.
 - **Hardened systemd units.** The daemon and the socket proxy run sandboxed;
   the proxy has no network and no capabilities at all.
+- **LAN mode is opt-in.** When on, names are announced on the local network and
+  `plain_admin` can serve the admin API over plain HTTP. Both weaken the rules
+  above for that network; see [docs/security.md](docs/security.md#lan-mode).
 
 A deploy key runs arbitrary `RUN` steps inside Docker, so treat it like any
 other CI credential. The design document has the full threat model.
@@ -473,6 +707,8 @@ other CI credential. The design document has the full threat model.
 cargo test                                  # unit tests, no Docker needed
 cargo test --test docker -- --ignored       # end-to-end tests against Docker
 cargo clippy --all-targets
+cargo build --no-default-features           # without LAN mode (no mdns-sd)
+cargo test --no-default-features
 ```
 
 The end-to-end tests start real daemons, socket proxies and Traefik
@@ -542,6 +778,7 @@ The source is laid out like this:
 | `src/server/sockproxy.rs` | Read-only Docker socket for Traefik |
 | `src/server/owner.rs` | Image user and volume ownership |
 | `src/server/setup.rs` | `server init`, keys, Traefik files, systemd units |
+| `src/server/lan/` | LAN mode: name derivation and checks (`hosts.rs`), the reconcile loop (`announce.rs`), the mDNS backend (`mdns.rs`), and the facade (`mod.rs`) |
 
 ## Status
 

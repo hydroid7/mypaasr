@@ -94,6 +94,9 @@ mypaas -r paas.example.com push .          # or a Dockerfile path: push Dockerfi
 - `push` packs the directory using the project's own `.gitignore` files only,
   so the bundle and its hash are the same on every runner.
 - The build runs on the server, so the runner needs no Docker.
+- A remote on a `.local` name (LAN mode with `plain_admin`, see the README)
+  is reachable only from a runner on the same network as the server. Hosted
+  runners are not, so CI should use the public admin domain.
 - If another deploy is running, `push` waits and retries for up to about 45
   seconds, then gives up with exit code 1.
 - `--json` prints one JSON object per line instead of text. `-q` prints only

@@ -24,6 +24,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
 use super::deploy::{self, Caller};
+use super::lan;
 use super::guard::{
     Backoff, InFlight, IpKey, IssueError, NonceResult, Nonces, RateLimiter, SIG_CHECKS_PER_SEC, TICKET_TTL, Ticket, Tickets,
 };
@@ -67,6 +68,8 @@ pub struct State {
     stats: Arc<Mutex<stats::StatsStore>>,
     /// Longest an upload may take; Traefik's readTimeout cuts it off at the same point.
     upload_timeout: Duration,
+    /// Wakes the LAN announcer after a deploy changed `current.json`.
+    lan: lan::LanHandle,
 }
 
 impl State {
@@ -86,6 +89,7 @@ impl State {
                 in_flight: InFlight::default(),
             }),
             secrets_lock: Mutex::new(()),
+            lan: lan::LanHandle::default(),
         }
     }
 
@@ -144,7 +148,13 @@ pub async fn run(paths: Paths) -> Result<()> {
     }
     let listener = TcpListener::bind(addr).await.with_context(|| format!("cannot listen on {addr}"))?;
     tracing::info!("mypaas daemon listening on {addr}");
-    let state = Arc::new(State::new(paths.clone()));
+    let mut state = State::new(paths.clone());
+    // mDNS trouble must not take the API down with it.
+    state.lan = lan::start(&paths, &cfg).unwrap_or_else(|e| {
+        tracing::error!("LAN mode could not start: {e:#}");
+        lan::LanHandle::default()
+    });
+    let state = Arc::new(state);
     if cfg.stats.enabled {
         tokio::spawn(stats::run(paths.clone(), state.stats.clone()));
     }
@@ -553,12 +563,14 @@ async fn upload(state: &Arc<State>, ipk: IpKey, req: Request<Incoming>, length: 
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let paths = state.paths.clone();
+    let lan = state.lan.clone();
     tokio::spawn(async move {
         let _lock = lock;
         let dir = paths.tmp().join(format!("unpack-{id}"));
         let result = unpack_and_deploy(&paths, &bundle, &dir, &ticket, &tx).await;
         let _ = std::fs::remove_file(&bundle);
         let _ = std::fs::remove_dir_all(&dir);
+        lan.poke();
         finish(&tx, &ticket.service, result);
     });
     (streamed(rx), Outcome::Ok(key_name))
@@ -640,9 +652,11 @@ fn rollback(state: &Arc<State>, key: &AuthorizedKey, service: String) -> Respons
     let caller = Caller { key_name: key.name.clone(), admin: key.scopes.contains(&Scope::Admin) };
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let paths = state.paths.clone();
+    let lan = state.lan.clone();
     tokio::spawn(async move {
         let _lock = lock;
         let result = deploy::rollback(&paths, &service, &caller, &tx).await;
+        lan.poke();
         finish(&tx, &format!("rollback {service}"), result);
     });
     streamed(rx)
@@ -657,9 +671,11 @@ fn remove(state: &Arc<State>, service: String) -> Response<Body> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let paths = state.paths.clone();
     let stats = state.stats.clone();
+    let lan = state.lan.clone();
     tokio::spawn(async move {
         let _lock = lock;
         let result = deploy::remove_service(&paths, &service, &tx).await;
+        lan.poke();
         if result.is_ok() {
             stats.lock().unwrap_or_else(|e| e.into_inner()).remove(&service);
         }

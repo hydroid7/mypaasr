@@ -1,0 +1,82 @@
+# Written by mypaas server init; changes are overwritten.
+
+# The upload route is exact, so it cannot also catch /v1/deploy-tickets.
+# No buffering middleware here: the daemon must see the headers before the body.
+[http.routers.mypaas-upload]
+rule = "Host(`paas.example.com`) && Path(`/v1/deploy`)"
+entryPoints = ["web-secure"]
+service = "mypaas-daemon"
+middlewares = ["mypaas-api-limit", "mypaas-api-inflight"]
+# Above any rule a service can produce (its default priority is the rule's
+# length, and service URLs are bounded and may not use this domain anyway).
+priority = 100001
+[http.routers.mypaas-upload.tls]
+certResolver = "default"
+options = "intermediate"
+
+[http.routers.mypaas-api]
+rule = "Host(`paas.example.com`) && PathPrefix(`/v1/`)"
+entryPoints = ["web-secure"]
+service = "mypaas-daemon"
+middlewares = ["mypaas-api-limit", "mypaas-api-inflight"]
+priority = 100000
+[http.routers.mypaas-api.tls]
+certResolver = "default"
+options = "intermediate"
+
+[http.routers.mypaas-api-redirect]
+rule = "Host(`paas.example.com`)"
+entryPoints = ["web"]
+middlewares = ["https-redirect"]
+service = "mypaas-daemon"
+priority = 100000
+
+[http.services.mypaas-daemon.loadBalancer]
+[[http.services.mypaas-daemon.loadBalancer.servers]]
+url = "http://127.0.0.1:88"
+
+# Per client address, in front of the daemon's own backoff. Neither buffers
+# the body. Behind a CDN, both need a sourceCriterion for its header.
+[http.middlewares.mypaas-api-limit.rateLimit]
+average = 10
+period = "1s"
+burst = 50
+
+[http.middlewares.mypaas-api-inflight.inFlightReq]
+amount = 16
+
+[http.middlewares.https-redirect.redirectScheme]
+scheme = "https"
+permanent = true
+
+[http.middlewares.hsts-header.headers]
+stsSeconds = 63072000
+stsIncludeSubdomains = true
+stsPreload = true
+
+# Used for every connection whose name no router claims. sniStrict refuses
+# the handshake instead of serving Traefik's default certificate, so scanners
+# that connect by IP learn nothing.
+[tls.options.default]
+minVersion = "VersionTLS12"
+sniStrict = true
+cipherSuites = [
+  "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+  "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+  "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+  "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+  "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305",
+  "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305",
+]
+
+[tls.options.intermediate]
+minVersion = "VersionTLS12"
+sniStrict = true
+cipherSuites = [
+  "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+  "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+  "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+  "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+  "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305",
+  "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305",
+]

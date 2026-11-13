@@ -36,6 +36,9 @@ jobs:
           restore-keys: test-${{ runner.os }}-
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      # Without the default `lan` feature, the mdns-sd dependency is not built.
+      - run: cargo clippy --all-targets --no-default-features --locked -- -D warnings
+      - run: cargo test --no-default-features --locked
 
   # End-to-end tests against the runner's Docker and a real Traefik.
   docker:

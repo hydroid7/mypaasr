@@ -111,7 +111,14 @@ enum Command {
 #[derive(Subcommand)]
 enum SecretCmd {
     /// Set a secret; the value comes from stdin or a hidden prompt.
-    Set { service: String, key: String },
+    Set {
+        service: String,
+        key: String,
+        /// Allow sending the value over a plain-HTTP (LAN) remote, readable by
+        /// anyone on that network.
+        #[arg(long)]
+        plain_secrets: bool,
+    },
     /// List secret names.
     Ls { service: String },
     /// Remove a secret.
@@ -152,6 +159,10 @@ enum ServerCmd {
         /// Public key file (or - for stdin) to add as the first admin key.
         #[arg(long)]
         key: Option<String>,
+        /// Turn on LAN mode: announce .local service names over mDNS. With a
+        /// .local --domain, the admin API is also served over plain HTTP.
+        #[arg(long)]
+        lan: bool,
     },
     /// Restart the daemon, the router (Traefik) or both.
     Restart {
@@ -245,7 +256,7 @@ async fn run(cli: Cli, out: Output) -> Result<()> {
         Command::Dashboard { service, since, watch } => {
             client::dashboard::dashboard(remote, client::dashboard::DashboardArgs { service, since, watch }, out).await
         }
-        Command::Secret(SecretCmd::Set { service, key }) => client::ops::secret_set(remote, &service, &key, out).await,
+        Command::Secret(SecretCmd::Set { service, key, plain_secrets }) => client::ops::secret_set(remote, &service, &key, plain_secrets, out).await,
         Command::Secret(SecretCmd::Ls { service }) => client::ops::secret_ls(remote, &service, out).await,
         Command::Secret(SecretCmd::Rm { service, key }) => client::ops::secret_rm(remote, &service, &key, out).await,
         Command::Doctor => client::ops::doctor(remote, out).await,
@@ -275,7 +286,7 @@ fn prompt(question: &str) -> Result<String> {
 async fn run_server(cmd: ServerCmd) -> Result<()> {
     let paths = Paths::from_env()?;
     match cmd {
-        ServerCmd::Init { domain, email, key } => {
+        ServerCmd::Init { domain, email, key, lan } => {
             let domain = match domain {
                 Some(d) => d,
                 None => prompt("admin domain (e.g. paas.example.com): ")?,
@@ -284,7 +295,7 @@ async fn run_server(cmd: ServerCmd) -> Result<()> {
                 Some(e) => e,
                 None => prompt("Let's Encrypt account email (optional, Enter to skip): ")?,
             };
-            server::setup::init(&paths, &domain, &email, key.as_deref())
+            server::setup::init(&paths, &domain, &email, key.as_deref(), lan)
         }
         ServerCmd::Restart { what } => server::setup::restart(&paths, &what),
         ServerCmd::Deploy { path } => local_deploy(&paths, &path).await,

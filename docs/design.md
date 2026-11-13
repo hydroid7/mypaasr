@@ -23,21 +23,26 @@ findings, the remaining risk and an operator checklist, is in
 8. [Isolation](#isolation)
 9. [Volumes and secrets](#volumes-and-secrets)
 10. [Routing with Traefik](#routing-with-traefik)
-11. [Deploys and rollback](#deploys-and-rollback)
-12. [History and the dashboard](#history-and-the-dashboard)
-13. [Client CLI](#client-cli)
-14. [Server CLI](#server-cli)
-15. [Decisions log](#decisions-log)
-16. [Open questions](#open-questions)
+11. [LAN mode](#lan-mode)
+12. [Deploys and rollback](#deploys-and-rollback)
+13. [History and the dashboard](#history-and-the-dashboard)
+14. [Client CLI](#client-cli)
+15. [Server CLI](#server-cli)
+16. [Decisions log](#decisions-log)
+17. [Open questions](#open-questions)
 
 ## Goals
 
 - **One Dockerfile per service.** Its comments are the whole configuration, and
   `mypaas push` deploys it.
 - **A small server surface.** One daemon API behind Traefik, reached over
-  HTTPS. No dashboard, no extra listeners.
+  HTTPS. No dashboard, no extra listeners. Two exceptions exist only when
+  [LAN mode](#lan-mode) is on: a UDP 5353 responder that announces names, and,
+  if `plain_admin` is set, a plain-HTTP admin API. The second weakens the
+  HTTPS goal on purpose; see the decisions log.
 - **Deploys from anywhere.** A laptop or a CI runner needs only HTTPS and a
-  key, not SSH access.
+  key, not SSH access. In LAN mode a device on the same network can also
+  deploy over plain HTTP, if the server opted in.
 - **No work for strangers.** An unauthenticated caller can never make the
   server read, store or unpack a large amount of data.
 - **Isolated services by default.** Services share something (a network, a
@@ -55,6 +60,7 @@ but on the server, Kubernetes, raw TCP or UDP services.
 | Internet client without a key | Reach ports 80 and 443 and send small requests, which are rejected cheaply and slowed down exponentially | Upload data, read anything, learn whether a key id exists |
 | Holder of a scoped key | Deploy, roll back, read logs of, manage secrets of or remove the services its scope covers. Its containers run with all capabilities dropped on their own network, and can join any shared network they name. | Act on services outside its scope, read a secret value back, route the admin domain or another service's URL, set Traefik labels, mount host paths, add capabilities, run privileged containers |
 | Holder of an admin key | Additionally add capabilities and mount allowlisted host paths | Add, change or remove keys, or change the allowlist (both are edited on the server only) |
+| LAN observer (LAN mode on) | Read plain-HTTP traffic to `.local` services; see which names are announced; with `plain_admin`, also read the admin API's requests and responses, including secret values, and answer for the admin name if it wins it on the network | Forge a signed request, upload a bundle or use a key. Signatures, tickets and the bundle hash still hold, but a captured request can be relayed within its 30-second window (see [security.md](security.md#lan-mode)) |
 
 A build runs arbitrary Dockerfile `RUN` steps, so a deploy key is as powerful
 as any production CI credential. Shared networks are open on purpose (see
@@ -113,6 +119,7 @@ units, so both install paths end in the same state.
   volumes/<service>/<name>/
   stats/<service>.json  traffic, uptime and memory history
   logs/access.log       Traefik's access log, read and rotated by the daemon
+  lan/state.json        LAN names and their announce state (LAN mode only)
   run/docker.sock       the socket proxy
   tmp/                  uploads and unpacked bundles
 ```
@@ -446,6 +453,8 @@ of memory and 512 processes.
   without a certificate fails instead of revealing Traefik's default one.
 - `server init` asks for the admin domain and an optional Let's Encrypt
   account email, which must look like `local@domain.tld`.
+- With `lan.plain_admin`, the two daemon routers use `web` without TLS, and
+  `web` takes `router.read_timeout`. See [LAN mode](#lan-mode).
 
 **Labels for one `https://` URL**
 
@@ -477,6 +486,116 @@ traefik.http.routers.shop-example-com-https-redirect.middlewares=https-redirect@
   `traefik.` or `mypaas.`; otherwise a Dockerfile could route any domain to
   itself.
 - A service without `url` gets no Traefik labels at all.
+
+## LAN mode
+
+LAN mode announces service names on the local network over mDNS, so a laptop
+or phone on the same Wi-Fi can open `http://shop.local` without DNS or hosts
+files. It is off by default. It adds no process: the announcer runs inside
+`mypaasd`.
+
+**Build and switch.** The Cargo feature `lan` (on by default) includes the
+`mdns-sd` library. A binary built with `--no-default-features` has no LAN mode;
+if `lan.enabled` is set there, the config fails to load with an explicit
+message, rather than silently announcing nothing. When the feature is on,
+`lan.enabled = false` means no thread, no socket, no state file, no extra URL
+checks, and a systemd unit identical to one without LAN mode.
+
+```toml
+[lan]
+enabled = false
+interfaces = []         # empty = up, non-loopback, non-Docker interfaces
+allow = ["*.local"]     # globs of .local names services may claim
+plain_admin = false     # serve the admin API over plain HTTP; needs enabled and a .local admin domain
+```
+
+**Declaring a name.** A service uses the existing `url` key:
+
+```dockerfile
+# mypaas.service=shop
+# mypaas.url=http://shop.local
+# mypaas.port=8080
+```
+
+Checked at deploy, and only when `lan.enabled` is set:
+
+- Only hosts ending in `.local` are announced. Public URLs in the same
+  Dockerfile are unaffected.
+- `https://….local` is refused: "HTTPS for .local needs a certificate, which
+  LAN mode does not provide yet". Traefik would ask Let's Encrypt for a name it
+  can never issue.
+- A name with more than one label before `.local` (`api.shop.local`) is
+  accepted with a warning. Some resolvers handle only `name.local`.
+- The server's own `<hostname>.local` is reserved, and so is the admin domain
+  (as before). When the admin domain is a `.local` name, the server announces it
+  itself.
+- The host must match one of the `allow` globs.
+- Duplicate URLs fail the deploy, as they always did.
+
+**Routing.** Nothing new. An `http://` URL gets the `web` router as before, and
+Traefik on port 80 serves the name once it resolves to the server.
+
+**The announcer.** A thread in `mypaasd`, outside the tokio runtime, so a bug in
+the mDNS code cannot stall the API. It runs a reconcile loop:
+
+1. Every 5 seconds, and at once when a deploy, rollback or removal in the daemon
+   pokes it, read `services/*/current.json` and collect the `.local` hosts.
+2. Diff that against what is announced. New names are registered; removed names
+   are withdrawn, and the library sends goodbye packets.
+3. Each name is registered as an `_http._tcp` service with that host name on
+   port 80. The library probes before it announces.
+
+Deploys made by `mypaas server deploy` in another process are picked up by the
+poll, so the announcer never depends on how a deploy was started. Names are
+announced while the spec is on disk, even if the containers are down, since a
+failed deploy restores the previous spec.
+
+Addresses: the library follows the interfaces and rechecks them every 30
+seconds, so a DHCP change moves the address records. Both A and AAAA records
+are published, including link-local IPv6 addresses: resolvers ask for both at
+once, and when nothing answers the AAAA query on IPv6 a lookup stalls for about
+5 seconds (measured in the spike with nss-mdns and Avahi). Publishing IPv4 only
+while listening on IPv6 made lookups fail outright, so it is not an option.
+Clients may therefore connect over IPv6; Traefik listens on both families.
+
+If another device already holds a name, the library would rename this one
+(`shop-2.local`). Traefik routes by the exact `Host`, so mypaas treats a rename
+as a `conflict`: it withdraws the name and reports it in `mypaas ls` and
+`status`. The state of each host (`announced`, `conflict` or `error`) is written
+to `~/_mypaas/lan/state.json`.
+
+The announcer talks to the library through a small trait, so the backend can
+change (for example to Avahi over D-Bus) and the reconcile logic is tested with
+a fake.
+
+**Plain-HTTP admin API (`plain_admin`).** Decided and recorded in the decisions
+log, because it weakens the HTTPS goal. A server with no public domain can then
+be driven from the LAN with no SSH tunnel and no certificate.
+
+- Valid only with `lan.enabled` and a `.local` `domain`; otherwise the config
+  fails to load. A hostname alone never switches TLS off.
+- The two daemon routers move from `web-secure` to `web` and lose their TLS
+  options. The HTTP-to-HTTPS redirect for the admin domain is not written. The
+  priorities, rate and in-flight limits and `router.api_allow` stay as they are.
+  With `plain_admin` off, `staticroutes.toml` is byte-identical to before.
+- The `web` entry point normally has a 60 second read timeout, which cuts
+  uploads. With `plain_admin` on, `web` uses `router.read_timeout`. Side effect:
+  port 80 tolerates slow clients longer for every service. A dedicated listener
+  was rejected to keep the number of listeners down.
+- No HTTP/2 without TLS, so an early refusal of an upload reaches the client
+  only after the body is sent. The daemon still never reads the body; the cost
+  is LAN bandwidth.
+- The client accepts `http://` only for loopback and `.local` hosts, through
+  `lan::plain_remote_allowed`. A bare `paas.local` stays HTTPS, so the scheme is
+  always explicit: `mypaas remote add lan http://paas.local`.
+- Secrets: `mypaas secret set` on a plain remote refuses unless `--plain-secrets`
+  is given. `doctor` warns that the connection is not encrypted.
+- `server init` and daemon start warn when `plain_admin` is on and
+  `router.api_allow` is empty. The warning is not an error (see open questions).
+
+**Not in this version:** HTTPS for `.local` names (needs a certificate
+authority), mDNS across subnets, and IPv6 beyond the addresses the library
+publishes by itself.
 
 ## Deploys and rollback
 
@@ -576,7 +695,8 @@ read:
 (`paas.example.com` or `https://paas.example.com`); remote names cannot contain
 dots, so the two never clash. With a single remote it is the default, and
 `MYPAAS_REMOTE` overrides it. Plain HTTP is accepted only for a daemon on
-loopback, for development.
+loopback, for development, and for an explicit `http://` remote on a `.local`
+name when the server runs `plain_admin` (see [LAN mode](#lan-mode)).
 
 | Command | Scope | What it does |
 | --- | --- | --- |
@@ -589,7 +709,7 @@ loopback, for development.
 | `dashboard [service]` | `read` | Uptime, memory and request charts; `--since`, `--watch` |
 | `rollback <service>` | `deploy` | Redeploy the previous version |
 | `rm <service>` | `rm` | Remove containers, network, stored spec and history; volumes and secrets stay |
-| `secret set\|ls\|rm <service> [KEY]` | `secrets` | The value comes from stdin or a hidden prompt |
+| `secret set\|ls\|rm <service> [KEY]` | `secrets` | The value comes from stdin or a hidden prompt. Over a plain-HTTP remote, `set` refuses unless `--plain-secrets` is given. |
 | `key init\|gen\|show` | | Create or select a key, print a passwordless CI key, print the public line |
 | `doctor` | `read` | Check the key, TLS, the clock (warning above 10 s, failure above 25 s) and a signed request |
 
@@ -609,7 +729,7 @@ the API.
 
 | Command | What it does |
 | --- | --- |
-| `server init [--domain D] [--email E] [--key FILE]` | Creates `~/_mypaas`, `config.toml`, `authorized_keys`, `acme.json` (0600), the Traefik files and the systemd units, and starts `mypaas-firewall`. `--key` adds the first key with `admin`, because without one nobody can log in. Safe to run again: keys, certificates and secrets stay. |
+| `server init [--domain D] [--email E] [--key FILE] [--lan]` | Creates `~/_mypaas`, `config.toml`, `authorized_keys`, `acme.json` (0600), the Traefik files and the systemd units, and starts `mypaas-firewall`. `--key` adds the first key with `admin`, because without one nobody can log in. `--lan` sets `lan.enabled`; with a `.local` `--domain` it also sets `plain_admin`, after a warning. Safe to run again: keys, certificates and secrets stay. |
 | `server restart all\|daemon\|router` | `daemon` restarts `mypaasd`; `router` rewrites the Traefik files, restarts the socket proxy, pulls the pinned image and replaces the Traefik container; `all` does both |
 | `server deploy DIR` | Deploys a local directory as admin through the same code as the API, for debugging |
 | `server key add FILE\|- --name N --scope S… [--expires DATE]` | Validates the key and appends it atomically |
@@ -619,7 +739,9 @@ the API.
 
 `config.toml` is read again at every deploy, so changes to `[limits]`,
 `[defaults]`, `[maximums]` and `[volumes]` need no restart. Changes to
-`[router]` and `[stats]` need `mypaas server restart all`.
+`[router]` and `[stats]` need `mypaas server restart all`. Changes to `[lan]`
+need `mypaas server init`, which rewrites the unit and the Traefik files, and then
+`mypaas server restart all`.
 
 ## Decisions log
 
@@ -733,6 +855,48 @@ Each entry: what was decided, and why.
   job publishes. Each file has a SHA-256 and a GitHub build attestation, and
   every third-party action is pinned by commit.
 
+**LAN mode**
+
+- **The admin API may be plain HTTP on a LAN name, if the server opts in.**
+  This is an explicit exception to the goal of an API reached over HTTPS, and
+  to the first transport decision ("HTTPS with signatures"). It applies only
+  with `lan.plain_admin`. Reason: a server without a public domain can be run
+  from the LAN with no SSH tunnel and no certificate, and there is no certificate
+  authority for `.local` names. What is given up (confidentiality of the traffic,
+  response integrity, server identity on the LAN) is listed in
+  [security.md](security.md#lan-mode). What still holds: signatures over the
+  host, method, path, time, nonce and body; single-use tickets; and the bundle
+  hash. It is off by default and needs three server-side settings, so a hostname
+  alone never weakens TLS.
+- **Plain HTTP is only for `.local` and loopback, and always written out.** The
+  client refuses `http://` for any other host, and a bare `paas.local` stays
+  HTTPS, so no one switches to plain HTTP by accident.
+- **No HTTPS for `.local` names.** A certificate for them would need a private
+  authority that every device trusts. Until one exists, such URLs are refused at
+  deploy rather than left to fail at the first request.
+- **The announcer is part of the daemon, on its own thread.** A separate unit
+  would add a process, but the daemon already holds the state and the Docker
+  access. The thread sits outside the async runtime so that the mDNS code can
+  fail without stalling the API. It reads state from disk, so deploys made by
+  another process are announced too.
+- **The mDNS library hides behind a trait.** It can be replaced (for example by
+  Avahi) without touching the reconcile logic, which is tested with a fake.
+- **Withdraw a conflicting name; never accept a rename.** A renamed host
+  (`shop-2.local`) does not match the `Host` header the route expects, so the
+  name is shown as a conflict and withdrawn.
+- **Announce when the spec is on disk.** A name is not held back until the
+  containers are healthy. A failed deploy restores the previous spec, so the
+  names stay right.
+- **Only `.local` names, on one subnet.** Public names are not announced, since
+  mDNS does not resolve them; multi-subnet operation is left out. AAAA records
+  are published as well, because without them every lookup waits about 5 s for
+  the AAAA query to time out (spike, 2026-11-13).
+- **Both switches, and off means off.** The Cargo feature removes the code, and
+  `lan.enabled` removes the behaviour; a build without the feature refuses an
+  enabled config rather than ignoring it.
+- **Sandbox grows only with LAN mode.** The unit adds `AF_NETLINK` to the allowed
+  address families only when `lan.enabled` is set; otherwise it is unchanged.
+
 ## Open questions
 
 - **Privileges without an admin key.** `cap_add` and host-path volumes need
@@ -751,3 +915,10 @@ Each entry: what was decided, and why.
   settings and nothing more. Not implemented.
 - **Rootless Docker or Podman** would make the daemon itself
   non-root-equivalent.
+- **`plain_admin` with an empty `router.api_allow`.** Today this is a warning at
+  `server init` and at daemon start, not an error. Refusing to start is safer
+  but adds friction for a LAN where the operator has not thought about
+  allowlists. Which one is right is undecided.
+- **HTTPS for `.local` names.** It needs a certificate authority that the
+  devices on the network trust, which is not designed. Until then the deploy
+  refuses `https://….local`.

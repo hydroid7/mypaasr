@@ -88,6 +88,9 @@ pub async fn deploy_dir(
     let cfg = ServerConfig::load(paths)?;
     let limits = cfg.limits()?;
     let prepared = prepare(paths, &cfg, &limits, &spec, caller)?;
+    for w in super::lan::check_urls(&spec, &cfg)? {
+        say(progress, w);
+    }
 
     let deploy_id = new_deploy_id();
     let image = format!("{}:{deploy_id}", image_repo(&spec.service));
@@ -279,6 +282,7 @@ fn prepare(
     if let Some(u) = spec.urls.iter().find(|u| !cfg.domain.is_empty() && u.host == cfg.domain) {
         bail!("url {} is on the admin domain, which is reserved for the mypaas API", u.to_url());
     }
+    super::lan::check_urls(spec, cfg)?;
     check_url_conflicts(paths, spec)?;
 
     Ok(Prepared {

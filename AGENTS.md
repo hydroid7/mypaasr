@@ -27,6 +27,8 @@ cargo build
 cargo test                                  # unit tests, no Docker needed (~1s)
 cargo test --test docker -- --ignored       # end-to-end, needs Docker, busybox:1.36, traefik:v<TRAEFIK_VERSION>
 cargo clippy --all-targets                  # must stay warning-free
+cargo build --no-default-features           # without LAN mode (no mdns-sd)
+cargo test --no-default-features            # same tests, LAN feature off
 scripts/build-static.sh                     # musl static binary in target-musl/
 scripts/build-deb.sh                        # .deb of that binary in target-deb/
 scripts/vm-test.sh up|test|ssh|down         # full run on a local Debian VM (QEMU/KVM)
@@ -35,7 +37,9 @@ scripts/vm-test.sh up|test|ssh|down         # full run on a local Debian VM (QEM
 To run a daemon locally:
 `MYPAAS_HOME=/tmp/x mypaas server init --domain localhost.test`, then
 `MYPAAS_HOME=/tmp/x mypaas server daemon`. The client accepts a plain-HTTP
-remote on loopback only: `mypaas -r http://127.0.0.1:88 ls`.
+remote on loopback only: `mypaas -r http://127.0.0.1:88 ls`. In LAN mode with
+`plain_admin`, it also accepts `http://` for a `.local` host (see
+[design.md](docs/design.md#lan-mode)).
 
 ## Source layout
 
@@ -54,6 +58,7 @@ remote on loopback only: `mypaas -r http://127.0.0.1:88 ls`.
 | `src/server/docker.rs` | Thin `docker` CLI wrapper (argument vectors, never a shell) |
 | `src/server/owner.rs` | Image `USER` resolution, chowning named volumes |
 | `src/server/setup.rs` | `server init`, keys, Traefik files, systemd units, restart |
+| `src/server/lan/` | LAN mode, behind the `lan` feature: `mod.rs` facade and types, `hosts.rs` derivation and validation of `.local` names, `announce.rs` reconcile loop and the `Announcer` trait, `mdns.rs` mdns-sd backend |
 | `src/server/sockproxy.rs` | Read-only Docker socket proxy for Traefik |
 | `src/server/stats.rs` | History: access log ingest and usage samples in hourly buckets |
 | `.github/workflows/` | `ci.yml` (clippy, tests, Docker tests, builds, .deb install check) and `release.yml` (tag `v<version>` → GitHub release) |
@@ -98,6 +103,32 @@ without an explicit decision recorded in the design document.
   API allowlist change on the server, never through the API.
 - **Prune only what is ours.** Only objects labelled `mypaas.service` are ever
   pruned or removed.
+- **LAN mode stays removable, and off means off.** All of it lives in
+  `src/server/lan/`; other files call it only through the facade in `mod.rs`
+  (`start`, `poke`, `check_urls`, `plain_remote_allowed`, `read_state`). With
+  `lan.enabled = false` there is no thread, no socket, no state file, and the
+  Traefik files and systemd unit are byte-identical to a build without LAN mode
+  (golden files in `src/server/testdata/`). Both feature sets must build, test
+  and pass clippy.
+- **Plain HTTP only where decided.** The client speaks plain HTTP to loopback,
+  and to `.local` hosts only when built with the `lan` feature. The admin API
+  is served on port 80 only with `lan.plain_admin`, which config validation
+  allows only with `lan.enabled` and a `.local` admin domain. `secret set`
+  needs `--plain-secrets` on a plain LAN remote.
+
+## LAN mode notes
+
+- The announcer is a reconcile loop on its own thread (not in tokio): it reads
+  `services/*/current.json` every 5 s, and at once when a daemon deploy,
+  rollback or removal pokes it, and writes `lan/state.json`. Test it with the
+  fake `Announcer` in `announce.rs`; only `mdns.rs` touches the network.
+- Names get A and AAAA records. Publishing IPv4 only made dual-stack lookups
+  stall for about 5 s, or fail when IPv6 stayed open (spike, see
+  docs/design.md). Do not disable IPv6 in `mdns.rs` without re-testing with
+  `getent hosts` and `avahi-resolve`.
+- To try it locally: `MYPAAS_HOME=/tmp/x mypaas server init --lan --domain
+  paas-test.local`, set `listen` to a free loopback port, run
+  `mypaas server daemon`, then `avahi-resolve -4 -n paas-test.local`.
 
 ## Conventions
 

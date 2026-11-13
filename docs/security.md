@@ -17,6 +17,7 @@ From the internet, only Traefik is reachable, on ports 80 and 443.
 | A key holder | The API's authenticated endpoints, within the key's scopes | Traefik, then the daemon on `127.0.0.1:88` |
 | A deploy key | Arbitrary code at build time and in its containers | `docker build`, the service's containers |
 | A compromised service | Its own network, shared networks it joined, the internet | Docker networking |
+| A device on the LAN (LAN mode only) | The `.local` services over plain HTTP and their names; with `plain_admin`, the admin API over plain HTTP | Wi-Fi or the LAN, then Traefik on port 80. See [LAN mode](#lan-mode). |
 
 ## Findings and fixes
 
@@ -87,6 +88,50 @@ These are known and accepted, or need work beyond configuration:
 - **Base images are trusted.** A Dockerfile's `FROM` images come from their
   registries as they are.
 
+## LAN mode
+
+LAN mode (see [design.md](design.md#lan-mode)) is off by default. It is not
+covered by the review above, which assumes the server is on the internet. The
+risks below are the ones LAN mode adds. The risks of the internet review still
+apply on a LAN, and a LAN is not a trusted network: anyone on Wi-Fi can
+observe it.
+
+| Surface | Risk | Mitigation |
+| --- | --- | --- |
+| UDP 5353 responder in the root daemon | A parser bug is reachable by any device on the LAN, and it shares a process with Docker control | A memory-safe library on its own thread, outside the async runtime; the daemon unit stays sandboxed; LAN mode is off by default. The trait boundary lets the responder move into its own unit later. |
+| Name spoofing | A deploy key claims a name that another device already has, such as `printer.local` | Probing: a name that is already held is withdrawn, not taken over. `lan.allow` limits the names. The admin and server names are reserved. A deploy key may claim any free name in `allow`, as it may claim a free public host today. |
+| Information disclosure | mDNS shows which names exist | Only hosts listed in a `url` are announced, never services without one. Treat the names as public on that network. |
+| Plain HTTP to services | Other devices on the LAN read the traffic | Documented limit. Do not put secrets in a service that uses `http://….local`. HTTPS for `.local` is not offered yet. |
+| Plain-HTTP admin API (`plain_admin`) | Devices on the LAN read secrets, logs, bundles and signed requests; whoever wins the admin name receives the requests | Off unless set on the server; needs a `.local` domain and LAN mode. Signatures and tickets still hold. The client refuses to send secrets over it unless `--plain-secrets` is given. Set `router.api_allow`. Never forward port 80 from the internet. |
+| Sandbox | `AF_NETLINK` is allowed to the daemon for interface listing | Added to the unit only when `lan.enabled` is set. |
+
+### What stays protected with `plain_admin`
+
+- **Authentication.** Signatures cover the host, method, path, timestamp, nonce
+  and body hash. An observer cannot change a request, or reuse one after the
+  server has seen it, because the nonce is spent and the time window closes.
+- **Bundles.** The hash is signed in the ticket request and checked after the
+  upload is streamed, so a tampered upload is deleted unopened. A ticket seen on
+  the wire is bound to one exact size and hash, is single-use and expires after
+  60 seconds, so at most an observer can upload the same bundle again.
+
+### What is lost with `plain_admin`
+
+- **Confidentiality of the API traffic.** Secret values from `secret set`, logs,
+  `status` output, deploy logs and the bundle contents, which can include `.env`
+  files, are readable by any device on the network.
+- **Integrity of responses.** A client cannot tell a forged `result: ok` from a
+  real one.
+- **Server identity.** Whoever wins the admin name on the network (through mDNS
+  spoofing, or while the server is offline) receives the client's requests,
+  including secret values. Signatures stop it from reusing captured requests
+  later, but not from reading them, or from relaying one within its 30-second
+  window.
+- **Exposure beyond the LAN.** If port 80 is reachable from the internet, so is
+  the admin API. Traefik serves both on port 80, so a public `http://` service on
+  the same server does not hide the API from outside: `router.api_allow` is then
+  the only guard.
+
 ## Operator checklist
 
 mypaas configures Docker containers and Traefik. The host itself is yours to
@@ -137,3 +182,15 @@ harden:
    seems to come from the proxy, and one client's failures lock out everyone.
 9. **Back up `~/_mypaas`**, encrypted: it holds the keys' scopes, the secrets
    and the volumes.
+10. **LAN mode: never forward port 80 to a `plain_admin` server.** Do not
+    publish port 80 through the router, and make the firewall rule in item 1
+    accept 80 only from the LAN, if the server runs `plain_admin`. A server with
+    public `http://` services on port 80 needs a `router.api_allow` for the
+    admin name, because Traefik routes by name.
+11. **LAN mode: set `router.api_allow`** to your LAN's network, for example
+    `["192.168.1.0/24"]`, then run `mypaas server restart router`. Traefik then
+    answers everyone else with 403. Without it, `server init` and the daemon
+    warn.
+12. **LAN mode: use `--plain-secrets` knowingly.** It sends a secret value over
+    the LAN in clear text. Use it only on a network you trust, and change the
+    secret afterwards if it went over a network you do not.

@@ -15,7 +15,7 @@ pub const FIREWALL_UNIT: &str = "/etc/systemd/system/mypaas-firewall.service";
 /// Where Traefik sees the proxy's socket directory.
 const PROXY_MOUNT: &str = "/mypaas-run";
 
-pub fn init(paths: &Paths, domain: &str, email: &str, key: Option<&str>) -> Result<()> {
+pub fn init(paths: &Paths, domain: &str, email: &str, key: Option<&str>, lan: bool) -> Result<()> {
     for dir in [
         paths.root.clone(),
         paths.secrets_dir(),
@@ -31,7 +31,8 @@ pub fn init(paths: &Paths, domain: &str, email: &str, key: Option<&str>) -> Resu
     set_mode(&paths.root, 0o700)?;
     set_mode(&paths.secrets_dir(), 0o700)?;
 
-    let cfg = if paths.config().exists() {
+    // Without --lan the existing [lan] table is kept, so a rerun cannot switch LAN mode off by accident.
+    let mut cfg = if paths.config().exists() {
         let mut cfg = ServerConfig::load(paths)?;
         cfg.domain = domain.to_string();
         cfg.email = email.to_string();
@@ -39,9 +40,30 @@ pub fn init(paths: &Paths, domain: &str, email: &str, key: Option<&str>) -> Resu
     } else {
         ServerConfig { domain: domain.to_string(), email: email.to_string(), ..ServerConfig::default() }
     };
+    if lan {
+        cfg.lan.enabled = true;
+        if crate::server::lan::is_lan_host(&cfg.domain) {
+            cfg.lan.plain_admin = true;
+        }
+    }
     cfg.validate(paths)?;
     if cfg.domain.is_empty() {
         bail!("an admin domain is required");
+    }
+    if lan && cfg.lan.plain_admin {
+        eprintln!(
+            "warning: LAN mode serves the admin API over unencrypted HTTP on port 80 ({}).\n\
+             Every device on the LAN can read secrets, logs and deploy bundles, and whichever\n\
+             device wins the name on the LAN receives the requests. Never forward port 80 from\n\
+             the internet to this server.",
+            cfg.domain
+        );
+    }
+    if cfg.lan.plain_admin && cfg.router.api_allow.is_empty() {
+        eprintln!(
+            "warning: router.api_allow is empty, so any device on the LAN can reach the admin API.\n\
+             Set it in config.toml to your LAN's network, for example api_allow = [\"192.168.1.0/24\"]."
+        );
     }
     write_atomic(&paths.config(), toml::to_string_pretty(&cfg)?.as_bytes(), 0o600)?;
 
@@ -131,6 +153,15 @@ defaultMode = "drop"
     } else {
         String::new()
     };
+    // In LAN mode uploads arrive on port 80, so port 80 needs the upload limit too.
+    let (web_note, web_read) = if cfg.lan.plain_admin {
+        (
+            "# LAN mode: uploads arrive on this port, so it gets the same read timeout as web-secure.\n",
+            cfg.router.read_timeout.as_str(),
+        )
+    } else {
+        ("", "60s")
+    };
     format!(
         r#"# Written by mypaas server init; changes are overwritten.
 
@@ -140,8 +171,8 @@ level = "WARN"
 [entryPoints.web]
 address = ":80"
 
-[entryPoints.web.transport.respondingTimeouts]
-readTimeout = "60s"
+{web_note}[entryPoints.web.transport.respondingTimeouts]
+readTimeout = "{web_read}"
 idleTimeout = "60s"
 
 [entryPoints.web.http]
@@ -179,6 +210,8 @@ keyType = "EC256"
 entryPoint = "web"
 {access_log}"#,
         read_timeout = cfg.router.read_timeout,
+        web_note = web_note,
+        web_read = web_read,
     )
 }
 
@@ -209,41 +242,49 @@ pub fn staticroutes_toml(cfg: &ServerConfig) -> String {
             ),
         )
     };
+    // Plain-admin mode (LAN, docs/design.md): no certificate exists for the
+    // .local name, so the routers stay on port 80 and nothing redirects to HTTPS.
+    let (entry, plain_note, upload_tls, api_tls, redirect) = if cfg.lan.plain_admin {
+        (
+            "web",
+            "# LAN mode: the admin API is plain HTTP on port 80, with no certificate and no HTTPS redirect.\n\n",
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+    } else {
+        (
+            "web-secure",
+            "",
+            "[http.routers.mypaas-upload.tls]\ncertResolver = \"default\"\noptions = \"intermediate\"\n".to_string(),
+            "[http.routers.mypaas-api.tls]\ncertResolver = \"default\"\noptions = \"intermediate\"\n\n".to_string(),
+            format!(
+                "[http.routers.mypaas-api-redirect]\nrule = \"Host(`{domain}`)\"\nentryPoints = [\"web\"]\n\
+                 middlewares = [\"https-redirect\"]\nservice = \"mypaas-daemon\"\npriority = 100000\n\n"
+            ),
+        )
+    };
     format!(
         r#"# Written by mypaas server init; changes are overwritten.
 
-# The upload route is exact, so it cannot also catch /v1/deploy-tickets.
+{plain_note}# The upload route is exact, so it cannot also catch /v1/deploy-tickets.
 # No buffering middleware here: the daemon must see the headers before the body.
 [http.routers.mypaas-upload]
 rule = "Host(`{domain}`) && Path(`/v1/deploy`)"
-entryPoints = ["web-secure"]
+entryPoints = ["{entry}"]
 service = "mypaas-daemon"
 middlewares = [{allow_mw}"mypaas-api-limit", "mypaas-api-inflight"]
 # Above any rule a service can produce (its default priority is the rule's
 # length, and service URLs are bounded and may not use this domain anyway).
 priority = 100001
-[http.routers.mypaas-upload.tls]
-certResolver = "default"
-options = "intermediate"
-
+{upload_tls}
 [http.routers.mypaas-api]
 rule = "Host(`{domain}`) && PathPrefix(`/v1/`)"
-entryPoints = ["web-secure"]
+entryPoints = ["{entry}"]
 service = "mypaas-daemon"
 middlewares = [{allow_mw}"mypaas-api-limit", "mypaas-api-inflight"]
 priority = 100000
-[http.routers.mypaas-api.tls]
-certResolver = "default"
-options = "intermediate"
-
-[http.routers.mypaas-api-redirect]
-rule = "Host(`{domain}`)"
-entryPoints = ["web"]
-middlewares = ["https-redirect"]
-service = "mypaas-daemon"
-priority = 100000
-
-[http.services.mypaas-daemon.loadBalancer]
+{api_tls}{redirect}[http.services.mypaas-daemon.loadBalancer]
 [[http.services.mypaas-daemon.loadBalancer.servers]]
 url = "http://127.0.0.1:{port}"
 
@@ -280,6 +321,11 @@ sniStrict = {strict}
 cipherSuites = {CIPHERS}
 "#,
         strict = cfg.router.strict_sni,
+        entry = entry,
+        plain_note = plain_note,
+        upload_tls = upload_tls,
+        api_tls = api_tls,
+        redirect = redirect,
     )
 }
 
@@ -304,7 +350,13 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service";
 
-pub fn systemd_unit(paths: &Paths, exe: &Path) -> String {
+pub fn systemd_unit(paths: &Paths, exe: &Path, cfg: &ServerConfig) -> String {
+    // LAN mode lists interface addresses over netlink to know what to announce.
+    let (families, netlink_note) = if cfg.lan.enabled {
+        ("AF_UNIX AF_INET AF_INET6 AF_NETLINK", "# Interface addresses for mDNS announcements (LAN mode).\n")
+    } else {
+        ("AF_UNIX AF_INET AF_INET6", "")
+    };
     format!(
         r#"[Unit]
 Description=mypaas daemon
@@ -320,7 +372,7 @@ RestartSec=2
 UMask=0022
 {HARDENING}
 ReadWritePaths={root}
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+{netlink_note}RestrictAddressFamilies={families}
 # Port 88, and reading and chowning volume directories owned by service users.
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
 
@@ -328,7 +380,9 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE
 WantedBy=multi-user.target
 "#,
         exe = exe.display(),
-        root = paths.root.display()
+        root = paths.root.display(),
+        netlink_note = netlink_note,
+        families = families,
     )
 }
 
@@ -392,7 +446,7 @@ WantedBy=docker.service
 
 fn write_systemd_units(paths: &Paths, cfg: &ServerConfig) -> Result<()> {
     let exe = std::env::current_exe()?;
-    write_atomic(Path::new(SYSTEMD_UNIT), systemd_unit(paths, &exe).as_bytes(), 0o644)?;
+    write_atomic(Path::new(SYSTEMD_UNIT), systemd_unit(paths, &exe, cfg).as_bytes(), 0o644)?;
     write_atomic(Path::new(PROXY_UNIT), proxy_unit(paths, &exe).as_bytes(), 0o644)?;
     write_atomic(Path::new(FIREWALL_UNIT), firewall_unit().as_bytes(), 0o644)?;
     run("systemctl", &["daemon-reload"])?;
@@ -673,19 +727,98 @@ mod tests {
         let (_, public) = test_key();
         let keyfile = dir.path().join("k.pub");
         std::fs::write(&keyfile, &public).unwrap();
-        init(&paths, "paas.example.com", "", Some(keyfile.to_str().unwrap())).unwrap();
+        init(&paths, "paas.example.com", "", Some(keyfile.to_str().unwrap()), false).unwrap();
         std::fs::write(paths.secrets_file("a"), "X = \"1\"\n").unwrap();
-        init(&paths, "paas2.example.com", "", None).unwrap();
+        init(&paths, "paas2.example.com", "", None, false).unwrap();
         assert_eq!(list_keys(&paths).unwrap().len(), 1);
         // The same --key again is a no-op, a second one gets its own name.
-        init(&paths, "paas2.example.com", "", Some(keyfile.to_str().unwrap())).unwrap();
+        init(&paths, "paas2.example.com", "", Some(keyfile.to_str().unwrap()), false).unwrap();
         assert_eq!(list_keys(&paths).unwrap().len(), 1);
         let (_, other) = test_key();
         std::fs::write(&keyfile, &other).unwrap();
-        init(&paths, "paas2.example.com", "", Some(keyfile.to_str().unwrap())).unwrap();
+        init(&paths, "paas2.example.com", "", Some(keyfile.to_str().unwrap()), false).unwrap();
         let names: Vec<String> = list_keys(&paths).unwrap().into_iter().map(|k| k.name).collect();
         assert_eq!(names, vec!["admin", "admin-2"]);
         assert!(paths.secrets_file("a").exists());
         assert_eq!(ServerConfig::load(&paths).unwrap().domain, "paas2.example.com");
+    }
+
+    fn base_cfg() -> ServerConfig {
+        ServerConfig { domain: "paas.example.com".into(), email: "a@b.c".into(), ..ServerConfig::default() }
+    }
+
+    fn plain_cfg() -> ServerConfig {
+        let mut cfg = base_cfg();
+        cfg.domain = "paas.local".into();
+        cfg.lan.enabled = true;
+        cfg.lan.plain_admin = true;
+        cfg
+    }
+
+    fn unit(cfg: &ServerConfig) -> String {
+        systemd_unit(&Paths { root: "/var/lib/mypaas/_mypaas".into() }, Path::new("/usr/bin/mypaas"), cfg)
+    }
+
+    #[test]
+    fn default_config_output_is_unchanged() {
+        let cfg = base_cfg();
+        assert_eq!(traefik_toml(&cfg), include_str!("testdata/traefik.golden.toml"));
+        assert_eq!(staticroutes_toml(&cfg), include_str!("testdata/staticroutes.golden.toml"));
+        assert_eq!(unit(&cfg), include_str!("testdata/mypaasd.golden.service"), "the unit without LAN mode");
+    }
+
+    #[test]
+    fn plain_admin_keeps_the_admin_api_on_port_80() {
+        let mut cfg = plain_cfg();
+        cfg.router.api_allow = vec!["192.168.1.0/24".into()];
+        let t: toml::Value = toml::from_str(&traefik_toml(&cfg)).unwrap();
+        let s: toml::Value = toml::from_str(&staticroutes_toml(&cfg)).unwrap();
+        assert_eq!(
+            t["entryPoints"]["web"]["transport"]["respondingTimeouts"]["readTimeout"].as_str(),
+            Some(cfg.router.read_timeout.as_str()),
+            "uploads arrive on port 80, so it needs the upload read timeout"
+        );
+        let routers = &s["http"]["routers"];
+        for r in ["mypaas-upload", "mypaas-api"] {
+            assert_eq!(routers[r]["entryPoints"][0].as_str(), Some("web"), "{r}");
+            assert!(routers[r].get("tls").is_none(), "{r} has no certificate to present");
+            let mw: Vec<&str> = routers[r]["middlewares"].as_array().unwrap().iter().map(|m| m.as_str().unwrap()).collect();
+            assert_eq!(mw, ["mypaas-api-allow", "mypaas-api-limit", "mypaas-api-inflight"], "{r}");
+        }
+        assert_eq!(routers["mypaas-upload"]["priority"].as_integer(), Some(100_001));
+        assert_eq!(routers["mypaas-api"]["priority"].as_integer(), Some(100_000));
+        assert!(routers.get("mypaas-api-redirect").is_none(), "would redirect to HTTPS, which has no certificate");
+        assert!(!staticroutes_toml(&cfg).contains("web-secure"));
+    }
+
+    #[test]
+    fn netlink_is_allowed_only_in_lan_mode() {
+        let mut cfg = base_cfg();
+        assert!(!unit(&cfg).contains("AF_NETLINK"), "no netlink without LAN mode");
+        cfg.lan.enabled = true;
+        assert!(unit(&cfg).contains("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\n"));
+    }
+
+    #[cfg(feature = "lan")]
+    #[test]
+    fn init_with_lan_on_a_local_domain_serves_plain_admin_and_rerun_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { root: dir.path().join("_mypaas") };
+        init(&paths, "paas.local", "", None, true).unwrap();
+        let cfg = ServerConfig::load(&paths).unwrap();
+        assert!(cfg.lan.enabled && cfg.lan.plain_admin);
+        init(&paths, "paas.local", "", None, false).unwrap();
+        let cfg = ServerConfig::load(&paths).unwrap();
+        assert!(cfg.lan.enabled && cfg.lan.plain_admin, "a rerun without --lan keeps [lan]");
+    }
+
+    #[cfg(feature = "lan")]
+    #[test]
+    fn init_with_lan_on_a_public_domain_enables_lan_without_plain_admin() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { root: dir.path().join("_mypaas") };
+        init(&paths, "paas.example.com", "", None, true).unwrap();
+        let cfg = ServerConfig::load(&paths).unwrap();
+        assert!(cfg.lan.enabled && !cfg.lan.plain_admin, "plain HTTP needs a .local name");
     }
 }

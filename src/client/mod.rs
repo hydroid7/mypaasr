@@ -19,6 +19,7 @@ use crate::auth;
 use crate::bundle::{self, Packed};
 use crate::config::{home_dir, write_atomic};
 use crate::server::daemon::{TicketRequest, TicketResponse};
+use crate::server::lan::plain_remote_allowed;
 use crate::spec::{is_valid_host, parse_dockerfile};
 
 /// Above this the client warns; the server's `max_upload` is the actual limit.
@@ -36,6 +37,7 @@ pub struct Exit {
 }
 
 pub const EXIT_ERROR: u8 = 1;
+pub const EXIT_USAGE: u8 = 2;
 pub const EXIT_DENIED: u8 = 3;
 pub const EXIT_DEPLOY_FAILED: u8 = 4;
 
@@ -240,6 +242,9 @@ fn save_remotes(r: &Remotes) -> Result<()> {
 }
 
 fn normalize_remote(domain: &str) -> Result<String> {
+    if domain.starts_with("http://") {
+        return normalize_plain(domain);
+    }
     let host = domain.strip_prefix("https://").unwrap_or(domain).trim_end_matches('/');
     if !is_valid_host(host) {
         bail!("invalid admin domain {domain:?}");
@@ -247,13 +252,49 @@ fn normalize_remote(domain: &str) -> Result<String> {
     Ok(format!("https://{host}"))
 }
 
+/// `http://HOST[:PORT]` for a `.local` name in LAN mode. Plain HTTP is never
+/// implied: a bare name still becomes HTTPS, see `normalize_remote`.
+fn normalize_plain(url: &str) -> Result<String> {
+    let rest = url.strip_prefix("http://").unwrap_or(url).trim_end_matches('/');
+    let (host, port) = match rest.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (rest, None),
+    };
+    if !is_valid_host(host) || !plain_remote_allowed(host) {
+        bail!("plain HTTP is only for .local names in LAN mode, not {url:?}; use https://{host} for a public domain");
+    }
+    if let Some(p) = port
+        && p.parse::<u16>().ok().filter(|&n| n > 0).is_none()
+    {
+        bail!("invalid port in {url:?}");
+    }
+    Ok(format!("http://{rest}"))
+}
+
+/// Whether a remote is reached over plain HTTP from another machine, so its
+/// traffic (secrets, logs, bundles) is readable on the network.
+pub fn is_plain_lan_remote(base: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base) else { return false };
+    let loopback = match url.host_str() {
+        Some("localhost") => true,
+        Some(h) => h.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()),
+        None => false,
+    };
+    url.scheme() == "http" && !loopback
+}
+
 pub fn remote_add(name: &str, domain: &str) -> Result<()> {
+    let mut r = load_remotes()?;
+    insert_remote(&mut r, name, domain)?;
+    save_remotes(&r)
+}
+
+fn insert_remote(r: &mut Remotes, name: &str, domain: &str) -> Result<()> {
     if !crate::spec::is_valid_name(name) {
         bail!("invalid remote name {name:?}");
     }
-    let mut r = load_remotes()?;
     r.remotes.insert(name.to_string(), normalize_remote(domain)?);
-    save_remotes(&r)
+    Ok(())
 }
 
 pub fn remote_rm(name: &str) -> Result<()> {
@@ -290,6 +331,8 @@ fn pick_remote(wanted: Option<&str>, remotes: &Remotes) -> Result<String> {
         Some(w) if w.starts_with("http://127.0.0.1:") || w.starts_with("http://localhost:") => {
             Ok(w.trim_end_matches('/').to_string())
         }
+        // Plain HTTP to a LAN name, and only when the user wrote the scheme.
+        Some(w) if w.starts_with("http://") => normalize_plain(w),
         Some(w) if remotes.remotes.contains_key(w) => Ok(remotes.remotes[w].clone()),
         // Remote names cannot contain dots, so a dotted name is a domain.
         Some(w) if w.contains('.') && is_valid_host(w.trim_end_matches('/')) => normalize_remote(w),
@@ -330,7 +373,9 @@ impl Api {
             // daemon refuses an upload from its headers (busy, expired ticket),
             // the answer reaches the client at once. Traefik's HTTP/1.1 side
             // only passes it on after the whole body has been sent. Plain-HTTP
-            // remotes, for development on loopback, stay on HTTP/1.1.
+            // remotes (loopback for development, or a .local name in LAN mode,
+            // where the admin API is served without TLS) have no TLS, so they
+            // stay on HTTP/1.1 and get no HTTP/2 upgrade.
             .user_agent(concat!("mypaas/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(std::time::Duration::from_secs(15))
             .build()?;
@@ -607,6 +652,7 @@ pub async fn rm(remote: Option<&str>, service: &str, out: Output) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::lan::COMPILED;
 
     #[test]
     fn remote_forms() {
@@ -619,8 +665,48 @@ mod tests {
         assert_eq!(pick_remote(None, &r).unwrap(), "https://paas.example.com");
         assert!(pick_remote(Some("staging"), &r).is_err());
         assert!(pick_remote(Some("bad..host"), &r).is_err());
-        assert!(pick_remote(Some("http://example.com"), &r).is_err(), "plain HTTP only on loopback");
+        assert!(pick_remote(Some("http://example.com"), &r).is_err(), "plain HTTP only on loopback or .local");
         r.remotes.insert("b".into(), "https://b.example.com".into());
         assert!(pick_remote(None, &r).is_err(), "several remotes need -r");
+    }
+
+    #[test]
+    fn plain_http_is_only_for_lan_names_when_written_out() {
+        assert_eq!(normalize_remote("http://paas.local").is_ok(), COMPILED);
+        assert_eq!(normalize_remote("http://paas.local/").is_ok(), COMPILED);
+        assert!(normalize_remote("http://example.com").is_err());
+        assert!(normalize_remote("http://paas.local:0").is_err());
+        assert!(normalize_remote("http://paas.local/admin").is_err());
+    }
+
+    #[test]
+    fn a_bare_name_stays_https() {
+        assert_eq!(normalize_remote("paas.local").unwrap(), "https://paas.local");
+        assert_eq!(normalize_remote("https://paas.example.com/").unwrap(), "https://paas.example.com");
+        let remotes = Remotes::default();
+        assert_eq!(pick_remote(Some("paas.local"), &remotes).unwrap(), "https://paas.local");
+    }
+
+    #[test]
+    fn remote_add_stores_the_plain_url() {
+        let mut r = Remotes::default();
+        if COMPILED {
+            insert_remote(&mut r, "lan", "http://paas.local").unwrap();
+            assert_eq!(r.remotes["lan"], "http://paas.local");
+        } else {
+            assert!(insert_remote(&mut r, "lan", "http://paas.local").is_err());
+        }
+        assert!(insert_remote(&mut r, "web", "http://example.com").is_err());
+    }
+
+    #[test]
+    fn plain_remote_detection() {
+        assert!(is_plain_lan_remote("http://paas.local"));
+        assert!(is_plain_lan_remote("http://paas.local:8080"));
+        assert!(!is_plain_lan_remote("https://paas.example.com"));
+        assert!(!is_plain_lan_remote("http://127.0.0.1:88"));
+        assert!(!is_plain_lan_remote("http://localhost:88"));
+        assert!(!is_plain_lan_remote("http://[::1]:88"));
+        assert!(!is_plain_lan_remote("not a url"));
     }
 }

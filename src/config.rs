@@ -86,6 +86,30 @@ pub struct ServerConfig {
     pub volumes: VolumeConfig,
     pub router: RouterConfig,
     pub stats: StatsConfig,
+    pub lan: LanConfig,
+}
+
+/// LAN mode: `.local` service names announced over mDNS (docs/design.md, "LAN mode").
+/// Always compiled, so old configs and `deny_unknown_fields` keep working
+/// whether or not the binary was built with the `lan` feature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LanConfig {
+    pub enabled: bool,
+    /// Interface names to announce on; empty means every up, non-loopback,
+    /// non-Docker interface.
+    pub interfaces: Vec<String>,
+    /// Globs of `.local` names that services may claim.
+    pub allow: Vec<String>,
+    /// Serve the admin API over plain HTTP on port 80. Needs `enabled` and a
+    /// `.local` admin domain; see the security notes in docs/design.md.
+    pub plain_admin: bool,
+}
+
+impl Default for LanConfig {
+    fn default() -> Self {
+        LanConfig { enabled: false, interfaces: Vec::new(), allow: vec!["*.local".into()], plain_admin: false }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +205,7 @@ impl Default for ServerConfig {
             volumes: VolumeConfig::default(),
             router: RouterConfig::default(),
             stats: StatsConfig::default(),
+            lan: LanConfig::default(),
         }
     }
 }
@@ -256,6 +281,7 @@ impl ServerConfig {
         for entry in &self.volumes.allow {
             check_allowlist_entry(paths, entry)?;
         }
+        crate::server::lan::validate_config(self)?;
         Ok(())
     }
 
@@ -534,6 +560,14 @@ mod tests {
         let text = toml::to_string(&cfg).unwrap();
         let back: ServerConfig = toml::from_str(&text).unwrap();
         back.limits().unwrap();
+    }
+
+    /// A config written before LAN mode existed has no `[lan]` table.
+    #[test]
+    fn config_without_lan_section_loads() {
+        let back: ServerConfig = toml::from_str("domain = \"paas.example.com\"\n").unwrap();
+        assert_eq!(back.lan, LanConfig::default());
+        assert!(!back.lan.enabled);
     }
 }
 

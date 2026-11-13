@@ -1,7 +1,7 @@
 //! Handlers for the authenticated read and operate endpoints: services, status,
 //! logs and secrets. Authentication and scopes are checked in `daemon` before these run.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 
 use super::deploy::{self, DeployRecord, service_network, shared_network};
 use super::docker::{ContainerInfo, Usage, container_stats, list_containers};
+use super::lan;
 use super::stats::StatsStore;
 use crate::config::{Paths, load_secrets, save_secrets};
 use crate::spec::{ServiceSpec, VolumeSource, is_valid_env_name};
@@ -65,6 +66,26 @@ async fn health(spec: &ServiceSpec, containers: &[&ContainerInfo]) -> &'static s
     }
 }
 
+/// Announce state of a service's `.local` URLs, from the announcer's state file:
+/// `{ "shop.local": "announced" }`. Empty when LAN mode is off or has not run,
+/// or the service has no LAN URL, so the JSON stays as it was.
+fn lan_states(spec: &ServiceSpec, states: Option<&lan::LanState>) -> BTreeMap<String, String> {
+    let Some(states) = states else { return BTreeMap::new() };
+    spec.urls
+        .iter()
+        .filter(|u| lan::is_lan_host(&u.host))
+        .filter_map(|u| states.hosts.get(&u.host).map(|h| (u.host.clone(), h.label())))
+        .collect()
+}
+
+/// Adds the `lan` field, and only when there is something in it.
+fn with_lan(mut obj: Value, lan: BTreeMap<String, String>) -> Value {
+    if !lan.is_empty() {
+        obj["lan"] = json!(lan);
+    }
+    obj
+}
+
 fn sum_usage(containers: &[&ContainerInfo], usage: &HashMap<String, Usage>) -> Usage {
     containers.iter().filter_map(|c| usage.get(&c.name)).fold(Usage::default(), |a, u| Usage {
         cpu_percent: a.cpu_percent + u.cpu_percent,
@@ -90,6 +111,7 @@ pub async fn list_services(paths: &Paths, stats: &std::sync::Mutex<StatsStore>) 
     });
     let healths = futures_util::future::join_all(checks).await;
     let now = crate::auth::unix_now();
+    let lan_state = lan::read_state(paths);
     let traffic: Vec<u64> = {
         let stats = stats.lock().unwrap_or_else(|e| e.into_inner());
         rows.iter().map(|(name, _)| stats.requests_last_hour(name, now)).collect()
@@ -101,7 +123,7 @@ pub async fn list_services(paths: &Paths, stats: &std::sync::Mutex<StatsStore>) 
         .map(|(((name, rec), health), requests_1h)| {
             let mine = current_containers(&all, name);
             let u = sum_usage(&mine, &usage);
-            json!({
+            let obj = json!({
                 "service": name,
                 "running": mine.iter().filter(|c| c.running).count(),
                 "wanted": rec.spec.scale.max(1),
@@ -114,7 +136,8 @@ pub async fn list_services(paths: &Paths, stats: &std::sync::Mutex<StatsStore>) 
                 "deployed_at": rec.time,
                 "deployed_by": rec.key_name,
                 "has_previous": paths.service_dir(name).join("previous.json").exists(),
-            })
+            });
+            with_lan(obj, lan_states(&rec.spec, lan_state.as_ref()))
         })
         .collect();
     Ok(json!({ "services": services }))
@@ -194,7 +217,8 @@ pub async fn status(paths: &Paths, service: &str) -> Result<Option<Value>> {
         })
         .collect();
     let previous = deploy::read_record(&paths.service_dir(service).join("previous.json"))?;
-    Ok(Some(json!({
+    let lan = lan_states(spec, lan::read_state(paths).as_ref());
+    Ok(Some(with_lan(json!({
         "service": service,
         "urls": spec.urls.iter().map(|u| u.to_url()).collect::<Vec<_>>(),
         "port": spec.port,
@@ -209,7 +233,7 @@ pub async fn status(paths: &Paths, service: &str) -> Result<Option<Value>> {
         "containers": containers,
         "last_deploy": { "deploy_id": rec.deploy_id, "time": rec.time, "key_name": rec.key_name },
         "previous": previous.map(|p| json!({ "deploy_id": p.deploy_id, "time": p.time, "key_name": p.key_name })),
-    })))
+    }), lan)))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -358,7 +382,46 @@ pub fn remove_secret(paths: &Paths, service: &str, key: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::lan::HostState;
     use std::os::unix::fs::PermissionsExt;
+
+    fn spec_with_urls(urls: &[&str]) -> ServiceSpec {
+        let mut text = String::from("FROM busybox\n# mypaas.service=shop\n# mypaas.port=8080\n");
+        for u in urls {
+            text.push_str(&format!("# mypaas.url={u}\n"));
+        }
+        crate::spec::parse_dockerfile(&text).unwrap().0
+    }
+
+    #[test]
+    fn lan_state_is_reported_for_lan_urls_only() {
+        let spec = spec_with_urls(&["http://shop.local", "https://shop.example.com"]);
+        let mut states = lan::LanState::default();
+        states.hosts.insert("shop.local".into(), HostState::Conflict);
+        let got = lan_states(&spec, Some(&states));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got["shop.local"], HostState::Conflict.label());
+    }
+
+    #[test]
+    fn missing_state_or_unknown_host_adds_nothing() {
+        let spec = spec_with_urls(&["http://shop.local"]);
+        assert!(lan_states(&spec, None).is_empty());
+        assert!(lan_states(&spec, Some(&lan::LanState::default())).is_empty());
+        let public = spec_with_urls(&["https://shop.example.com"]);
+        let mut states = lan::LanState::default();
+        states.hosts.insert("shop.local".into(), HostState::Announced);
+        assert!(lan_states(&public, Some(&states)).is_empty());
+    }
+
+    #[test]
+    fn lan_field_is_omitted_when_empty() {
+        let plain = with_lan(json!({ "service": "shop" }), BTreeMap::new());
+        assert!(plain.get("lan").is_none());
+        let mut m = BTreeMap::new();
+        m.insert("shop.local".to_string(), "announced".to_string());
+        assert_eq!(with_lan(json!({ "service": "shop" }), m)["lan"]["shop.local"], "announced");
+    }
 
     #[test]
     fn log_query() {

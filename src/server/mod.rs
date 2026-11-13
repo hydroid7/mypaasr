@@ -5,6 +5,7 @@ pub mod daemon;
 pub mod deploy;
 pub mod docker;
 pub mod guard;
+pub mod lan;
 pub mod owner;
 pub mod setup;
 pub mod sockproxy;
