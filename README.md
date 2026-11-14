@@ -376,7 +376,8 @@ chown = true                    # hand empty named volumes to the image's user
 socket_proxy = true             # Traefik gets a read-only Docker socket
 read_timeout = "300s"           # longest request on :443, uploads included
 strict_sni = true               # refuse TLS for names without a certificate
-api_allow = []                  # e.g. ["203.0.113.0/24"]: only these reach the API
+api_allow = []                  # e.g. ["203.0.113.0/24"]: only these reach the API;
+                                # in LAN mode add "fe80::/10" (see LAN mode)
 
 [stats]
 enabled = true                  # Traefik writes an access log for `mypaas stats`
@@ -388,6 +389,11 @@ interfaces = []                 # empty: every up, non-loopback, non-Docker inte
 allow = ["*.local"]             # names services may claim
 plain_admin = false             # admin API over plain HTTP; see LAN mode
 ```
+
+Traefik answers clients outside `api_allow` with `403 Forbidden` before the
+daemon sees the request, and the client reports that as `denied`, like a bad
+key. If `mypaas doctor` passes but a later command is denied now and then,
+check that `api_allow` covers every address the client may come from.
 
 The server refuses to start if a `volumes.allow` entry overlaps `/`,
 `~/.ssh`, `~/_mypaas` or `/var/run`.

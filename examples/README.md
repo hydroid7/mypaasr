@@ -44,7 +44,9 @@ mypaas accepts.
   that use it.
 - **LAN names.** `http://….local` URLs are announced on the local network only
   when `[lan] enabled` is set on the server. Without it, the name is not
-  announced; the deploy still succeeds.
+  announced; the deploy still succeeds. If a push to a LAN server is denied
+  now and then, the server's `router.api_allow` is missing `fe80::/10` (see
+  [LAN mode](../README.md#lan-mode)).
 
 ## Which strategy?
 

@@ -261,7 +261,9 @@ before authentication costs the server more than one signature check.
 **Limits at the edge.** Traefik allows each client address 10 API requests
 per second (bursts of 50) and 16 in flight, before the daemon sees them.
 `router.api_allow` can restrict the API to a list of networks, so everyone
-else gets `403` from Traefik.
+else gets `403` from Traefik. With LAN mode the list needs `fe80::/10` as
+well, because clients may connect over the announced link-local address (see
+[LAN mode](#lan-mode)).
 
 **Other guards**
 
