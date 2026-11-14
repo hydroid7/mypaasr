@@ -331,7 +331,8 @@ Dockerfiles with different names in one repository, for example
 **Examples.** [examples/](../examples/README.md) holds one complete service per
 pattern: static files (`safe`), a stateless app (`roll` with a healthcheck),
 SQLite (stop first), staging and production from one project, a multi-stage
-build, an internal service with a worker, and a shared Postgres. A unit test
+build, an internal service with a worker, a shared Postgres, and two LAN
+services (a static page and an editable start page). A unit test
 parses every Dockerfile there, so they always match the parser.
 
 ## Isolation

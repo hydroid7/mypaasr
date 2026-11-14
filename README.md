@@ -540,7 +540,9 @@ mypaas -r lan push examples/lan-app
 mypaas -r lan ls                # shows lan-app.local as announced
 ```
 
-Open `http://lan-app.local` from any device on the network. Secrets need the
+Open `http://lan-app.local` from any device on the network.
+[examples/lan-dashboard](examples/lan-dashboard) is a start page at
+`http://dashboard.local` that lists links to your other LAN services. Secrets need the
 extra flag, because they cross the LAN unencrypted:
 
 ```sh

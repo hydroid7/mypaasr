@@ -26,6 +26,7 @@ mypaas accepts.
 | [redis-worker](redis-worker) | An internal service with no URL, and a background worker that talks to it over a shared network | `network=cache`, no `url`, a password in each service's secrets |
 | [postgres](postgres) | One Postgres shared by several apps, each with its own role and database | `network=db`, `volume`, init script, per-app secrets |
 | [lan-app](lan-app) | A page announced on the local network as `http://lan-app.local` (needs [LAN mode](../README.md#lan-mode)) | `url=http://….local`, read-only, no secrets |
+| [lan-dashboard](lan-dashboard) | A start page at `http://dashboard.local` with a grid of links, edited in the browser and kept in one JSON file (needs [LAN mode](../README.md#lan-mode)) | `url=http://….local`, `volume=data:/data`, read-only root |
 
 ## Before you deploy
 

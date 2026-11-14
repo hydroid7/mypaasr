@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #fff; --text: #1d2330; --muted: #667085;
+    --line: #d9dde5; --accent: #2f6fde; --danger: #c0392b;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171c; --card: #1e232b; --text: #e6e9ef; --muted: #8b93a3; --line: #323946; --accent: #6e9bff; --danger: #ff6b5e; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  header { display: flex; gap: .75rem; align-items: center; padding: 1rem 1.25rem; flex-wrap: wrap; }
+  header h1 { font-size: 1.25rem; margin: 0 auto 0 0; }
+  main { padding: 0 1.25rem 2rem; max-width: 1200px; margin: 0 auto; }
+  button, input { font: inherit; color: inherit; }
+  button { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: .35rem .75rem; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.icon { padding: .15rem .45rem; font-size: .85rem; }
+  button.danger { color: var(--danger); }
+  input { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: .4rem .6rem; width: 100%; }
+  #filter { width: 14rem; }
+  section { margin-top: 1.25rem; }
+  section h2 { display: flex; gap: .4rem; align-items: center; font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 .5rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: .75rem; min-height: 3rem; border-radius: 8px; }
+  .tile { position: relative; display: flex; flex-direction: column; align-items: center; gap: .3rem; padding: 1rem .5rem .75rem;
+          background: var(--card); border: 1px solid var(--line); border-radius: 8px; text-decoration: none; color: inherit; text-align: center; }
+  a.tile:hover { border-color: var(--accent); }
+  .tile .ic { font-size: 1.9rem; line-height: 1; width: 2.6rem; height: 2.6rem; display: grid; place-items: center; border-radius: 8px; }
+  .tile .ic img { width: 100%; height: 100%; object-fit: contain; }
+  .tile .ic.letter { background: var(--accent); color: #fff; font-size: 1.3rem; font-weight: 600; }
+  .tile .name { font-weight: 600; overflow-wrap: anywhere; }
+  .tile .host { font-size: .78rem; color: var(--muted); overflow-wrap: anywhere; }
+  .tools { display: none; gap: .25rem; margin-top: .3rem; }
+  body.editing .tools { display: flex; }
+  body.editing .tile { cursor: grab; }
+  body.editing .grid { outline: 1px dashed var(--line); outline-offset: 4px; }
+  .tile.dragging { opacity: .4; }
+  .grid.over { outline: 2px dashed var(--accent) !important; }
+  .add { border-style: dashed; color: var(--muted); justify-content: center; display: none; cursor: pointer; }
+  body.editing .add { display: flex; }
+  #status { font-size: .85rem; color: var(--muted); }
+  #status.err { color: var(--danger); }
+  .empty { color: var(--muted); padding: 2rem 0; text-align: center; }
+  dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--card); color: var(--text); width: min(26rem, 92vw); }
+  dialog::backdrop { background: #0006; }
+  dialog form { display: grid; gap: .6rem; }
+  dialog label { display: grid; gap: .2rem; font-size: .85rem; color: var(--muted); }
+  dialog menu { display: flex; justify-content: flex-end; gap: .5rem; padding: 0; margin: .4rem 0 0; }
+</style>
+
+<header>
+  <h1>Dashboard</h1>
+  <span id="status"></span>
+  <input id="filter" type="search" placeholder="Filter…" autocomplete="off">
+  <button id="edit">Edit</button>
+</header>
+<main id="main"></main>
+
+<dialog id="dlg">
+  <form method="dialog" id="form">
+    <strong id="dlg-title"></strong>
+    <label>Name <input name="name" required maxlength="80"></label>
+    <label id="url-row">URL <input name="url" required maxlength="500" placeholder="http://service.local"></label>
+    <label id="icon-row">Icon (an emoji; empty uses the site's favicon) <input name="icon" maxlength="8"></label>
+    <menu>
+      <button value="cancel" formnovalidate>Cancel</button>
+      <button value="ok" class="primary">Save</button>
+    </menu>
+  </form>
+</dialog>
+
+<script>
+"use strict";
+let state = { rev: 0, groups: [] };
+let editing = false;
+let drag = null; // { g, i } of the tile being dragged
+
+const $ = (s) => document.querySelector(s);
+const el = (tag, props = {}, ...kids) => {
+  const e = Object.assign(document.createElement(tag), props);
+  e.append(...kids);
+  return e;
+};
+
+function setStatus(msg, err = false) {
+  const s = $("#status");
+  s.textContent = msg;
+  s.className = err ? "err" : "";
+}
+
+async function load() {
+  const r = await fetch("/api/links");
+  const body = await r.json();
+  if (!r.ok) return setStatus(body.error, true);
+  state = body;
+  render();
+}
+
+// Every change is saved at once. The revision makes a save from a stale page
+// fail instead of overwriting what another device saved in between.
+async function save() {
+  render();
+  setStatus("Saving…");
+  const r = await fetch("/api/links", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(state),
+  });
+  const body = await r.json();
+  if (r.ok) {
+    state = body;
+    setStatus("Saved");
+    setTimeout(() => $("#status").textContent === "Saved" && setStatus(""), 1500);
+  } else if (r.status === 409) {
+    state = body.current;
+    setStatus("Changed on another device; reloaded. Please redo your last change.", true);
+  } else {
+    setStatus(body.error || "Save failed", true);
+    await load();
+    return;
+  }
+  render();
+}
+
+function host(url) {
+  try { return new URL(url).host; } catch { return url; }
+}
+
+function letter(link) {
+  return el("span", { className: "ic letter", textContent: link.name.slice(0, 1).toUpperCase() });
+}
+
+// No icon given: try the site's /favicon.ico, and show the first letter if
+// it does not load. The browser fetches it, since only devices on the LAN
+// (not this container) can resolve .local names.
+function icon(link) {
+  if (link.icon) return el("span", { className: "ic", textContent: link.icon });
+  let src;
+  try { src = new URL("/favicon.ico", link.url).href; } catch { return letter(link); }
+  const box = el("span", { className: "ic" });
+  const img = el("img", { src, alt: "", referrerPolicy: "no-referrer", onerror: () => box.replaceWith(letter(link)) });
+  box.append(img);
+  return box;
+}
+
+function button(label, title, onclick, cls = "icon") {
+  return el("button", { type: "button", className: cls, textContent: label, title, onclick: (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    onclick();
+  } });
+}
+
+function move(list, from, to) {
+  if (to < 0 || to >= list.length) return;
+  list.splice(to, 0, list.splice(from, 1)[0]);
+}
+
+function tile(link, g, i) {
+  const group = state.groups[g];
+  const t = el(editing ? "div" : "a", { className: "tile" },
+    icon(link),
+    el("span", { className: "name", textContent: link.name }),
+    el("span", { className: "host", textContent: host(link.url) }),
+    el("div", { className: "tools" },
+      button("←", "Move left", () => { move(group.links, i, i - 1); save(); }),
+      button("✎", "Edit", () => editLink(g, i)),
+      button("✕", "Remove", () => { if (confirm(`Remove ${link.name}?`)) { group.links.splice(i, 1); save(); } }, "icon danger"),
+      button("→", "Move right", () => { move(group.links, i, i + 1); save(); }),
+    ),
+  );
+  if (!editing) {
+    t.href = link.url; // the server accepts only http:// and https:// URLs
+    return t;
+  }
+  t.draggable = true;
+  t.addEventListener("dragstart", (e) => {
+    drag = { g, i };
+    t.classList.add("dragging");
+    e.dataTransfer.effectAllowed = "move";
+  });
+  t.addEventListener("dragend", () => t.classList.remove("dragging"));
+  // Dropping on a tile puts the dragged one in its place.
+  t.addEventListener("dragover", (e) => e.preventDefault());
+  t.addEventListener("drop", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dropAt(g, i);
+  });
+  return t;
+}
+
+function dropAt(g, i) {
+  if (!drag) return;
+  const [item] = state.groups[drag.g].links.splice(drag.i, 1);
+  state.groups[g].links.splice(i, 0, item);
+  drag = null;
+  save();
+}
+
+function render() {
+  document.body.classList.toggle("editing", editing);
+  $("#edit").textContent = editing ? "Done" : "Edit";
+  const q = $("#filter").value.trim().toLowerCase();
+  const main = $("#main");
+  main.replaceChildren();
+
+  state.groups.forEach((group, g) => {
+    const links = group.links
+      .map((link, i) => ({ link, i }))
+      .filter(({ link }) => !q || (link.name + " " + link.url).toLowerCase().includes(q));
+    if (!editing && links.length === 0) return;
+
+    const grid = el("div", { className: "grid" }, ...links.map(({ link, i }) => tile(link, g, i)));
+    if (editing) {
+      grid.append(el("div", { className: "tile add", textContent: "+ Add link", onclick: () => editLink(g, null) }));
+      // Dropping on the empty part of a group appends to it.
+      grid.addEventListener("dragover", (e) => { e.preventDefault(); grid.classList.add("over"); });
+      grid.addEventListener("dragleave", () => grid.classList.remove("over"));
+      grid.addEventListener("drop", (e) => {
+        e.preventDefault();
+        grid.classList.remove("over");
+        dropAt(g, group.links.length);
+      });
+    }
+
+    const title = el("h2", {}, el("span", { textContent: group.name }));
+    if (editing) {
+      title.append(el("span", { className: "tools" },
+        button("↑", "Move group up", () => { move(state.groups, g, g - 1); save(); }),
+        button("↓", "Move group down", () => { move(state.groups, g, g + 1); save(); }),
+        button("✎", "Rename group", () => editGroup(g)),
+        button("✕", "Remove group", () => {
+          if (confirm(`Remove the group ${group.name} and its ${group.links.length} links?`)) {
+            state.groups.splice(g, 1);
+            save();
+          }
+        }, "icon danger"),
+      ));
+    }
+    main.append(el("section", {}, title, grid));
+  });
+
+  if (editing) {
+    main.append(el("section", {}, button("+ Add group", "", () => editGroup(null), "")));
+  } else if (!main.children.length) {
+    main.append(el("p", { className: "empty", textContent: q ? "No matching links." : "No links yet. Click Edit to add some." }));
+  }
+}
+
+// One dialog for links and groups; resolves with the form values or null.
+function ask(title, values, withUrl) {
+  const dlg = $("#dlg"), form = $("#form");
+  $("#dlg-title").textContent = title;
+  $("#url-row").hidden = $("#icon-row").hidden = !withUrl;
+  form.url.required = withUrl;
+  for (const k of ["name", "url", "icon"]) form[k].value = values[k] || "";
+  dlg.showModal();
+  return new Promise((resolve) => {
+    dlg.addEventListener("close", () => {
+      if (dlg.returnValue !== "ok") return resolve(null);
+      resolve({ name: form.name.value.trim(), url: form.url.value.trim(), icon: form.icon.value.trim() });
+    }, { once: true });
+  });
+}
+
+async function editLink(g, i) {
+  const old = i === null ? {} : state.groups[g].links[i];
+  const v = await ask(i === null ? "Add link" : "Edit link", old, true);
+  if (!v) return;
+  if (!/^https?:\/\//i.test(v.url)) v.url = "http://" + v.url;
+  if (i === null) state.groups[g].links.push(v);
+  else state.groups[g].links[i] = v;
+  save();
+}
+
+async function editGroup(g) {
+  const v = await ask(g === null ? "Add group" : "Rename group", g === null ? {} : state.groups[g], false);
+  if (!v) return;
+  if (g === null) state.groups.push({ name: v.name, links: [] });
+  else state.groups[g].name = v.name;
+  save();
+}
+
+$("#edit").onclick = () => { editing = !editing; render(); };
+$("#filter").oninput = render;
+load();
+</script>
+</html>
