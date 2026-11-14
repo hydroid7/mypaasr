@@ -123,7 +123,7 @@ Under Settings → Secrets and variables → Actions:
 
 - add a secret `MYPAAS_PRIVATE_KEY` with the full contents of `ci.key`,
   including the `BEGIN` and `END` lines,
-- add a variable `MYPAAS_VERSION`, for example `0.1.0`.
+- add a variable `MYPAAS_VERSION`, for example `0.2.0`.
 
 ```yaml
 # .github/workflows/deploy.yml
@@ -171,7 +171,7 @@ CI/CD → Variables:
 
 - add `MYPAAS_KEY_FILE`, type **File**, **Protected**, with the contents of
   `ci.key`,
-- add `MYPAAS_VERSION`, for example `0.1.0`.
+- add `MYPAAS_VERSION`, for example `0.2.0`.
 
 ```yaml
 # .gitlab-ci.yml
