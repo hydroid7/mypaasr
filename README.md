@@ -505,8 +505,13 @@ the user that ran `init`, normally `/root/_mypaas/config.toml`):
 
 ```toml
 [router]
-api_allow = ["192.168.1.0/24", "fd12:3456:789a::/64"]  # your LAN's ranges from step 1
+api_allow = ["192.168.1.0/24", "fd12:3456:789a::/64", "fe80::/10"]  # your LAN's ranges from step 1
 ```
+
+Keep `fe80::/10`: mDNS also announces the server's link-local address, and a
+client that picks it connects from its own link-local address. Without it,
+deploys fail now and then with `denied`. Link-local addresses do not cross a
+router, so this admits only devices on the same network segment.
 
 Then write the files again and start everything:
 
@@ -637,7 +642,7 @@ Then restrict the admin API to your network. In `config.toml`:
 
 ```toml
 [router]
-api_allow = ["192.168.1.0/24", "fd12:3456:789a::/64"]  # your LAN's IPv4 and unique local IPv6 ranges
+api_allow = ["192.168.1.0/24", "fd12:3456:789a::/64", "fe80::/10"]  # your LAN's IPv4, unique local IPv6 and link-local ranges
 ```
 
 and run `mypaas server restart all`. Traefik answers everyone else with 403.
