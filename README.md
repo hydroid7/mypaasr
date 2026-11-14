@@ -36,12 +36,12 @@ You need a Linux server with Docker and systemd, and a DNS name for the admin
 API (here `paas.example.com`) pointing at it. Ports 80 and 443 must be free.
 
 Install mypaas from the [latest release](https://github.com/hydroid7/mypaasr/releases/latest).
-On Debian or Ubuntu (amd64), as root, take the `.deb` (replace `0.1.0` with
+On Debian or Ubuntu (amd64), as root, take the `.deb` (replace `0.2.0` with
 the release's version):
 
 ```sh
-curl -fLO https://github.com/hydroid7/mypaasr/releases/download/v0.1.0/mypaas_0.1.0_amd64.deb
-apt install ./mypaas_0.1.0_amd64.deb      # /usr/bin/mypaas; recommends Docker
+curl -fLO https://github.com/hydroid7/mypaasr/releases/download/v0.2.0/mypaas_0.2.0_amd64.deb
+apt install ./mypaas_0.2.0_amd64.deb      # /usr/bin/mypaas; recommends Docker
 ```
 
 On any other x86_64 Linux, take the static binary, which runs whatever the
