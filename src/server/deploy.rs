@@ -452,10 +452,21 @@ impl Run<'_> {
         self.create(name).await?;
         docker(&["start", name]).await?;
         if let Err(e) = self.wait_ready(name).await {
-            if let Ok(logs) = docker(&["logs", "--tail", "20", name]).await {
-                for line in logs.lines() {
+            // `docker logs` replays the container's stderr on its own stderr, and
+            // most crashing programs write their error there, so read both.
+            if let Ok(out) = tokio::process::Command::new("docker")
+                .args(["logs", "--tail", "20", name])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .await
+            {
+                let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+                for line in text.lines() {
                     say(self.progress, format!("  {line}"));
                 }
+            }
+            if let Ok(state) = docker(&["inspect", "--format", "exit code {{.State.ExitCode}}, oom-killed {{.State.OOMKilled}}", name]).await {
+                say(self.progress, format!("  ({})", state.trim()));
             }
             return Err(e);
         }
