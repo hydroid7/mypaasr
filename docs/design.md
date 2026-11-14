@@ -261,7 +261,9 @@ before authentication costs the server more than one signature check.
 **Limits at the edge.** Traefik allows each client address 10 API requests
 per second (bursts of 50) and 16 in flight, before the daemon sees them.
 `router.api_allow` can restrict the API to a list of networks, so everyone
-else gets `403` from Traefik.
+else gets `403` from Traefik. With LAN mode the list needs `fe80::/10` as
+well, because clients may connect over the announced link-local address (see
+[LAN mode](#lan-mode)).
 
 **Other guards**
 
@@ -331,7 +333,8 @@ Dockerfiles with different names in one repository, for example
 **Examples.** [examples/](../examples/README.md) holds one complete service per
 pattern: static files (`safe`), a stateless app (`roll` with a healthcheck),
 SQLite (stop first), staging and production from one project, a multi-stage
-build, an internal service with a worker, and a shared Postgres. A unit test
+build, an internal service with a worker, a shared Postgres, and two LAN
+services (a static page and an editable start page). A unit test
 parses every Dockerfile there, so they always match the parser.
 
 ## Isolation
@@ -564,9 +567,12 @@ own global address, and on most home connections the ISP changes that prefix
 at reconnects. `router.api_allow` could not list it, so the admin API would
 refuse a client or not depending on which record it picked (seen on the first
 real install, 2026-11-13). With global addresses left out, a client arrives
-from an IPv4 address or the LAN's unique local prefix, and both stay put. A LAN
-with no unique local prefix gets link-local AAAA records only, and clients fall
-back to IPv4.
+from an IPv4 address, the LAN's unique local prefix or a link-local address,
+and all three stay put. A client that picks the link-local record connects from
+its own `fe80::` address, so `api_allow` on a LAN must include `fe80::/10`
+(found 2026-11-14: pushes failed now and then with `denied`, refused by
+Traefik before the daemon saw them). Link-local addresses do not cross a
+router, so this admits no one beyond the network segment.
 
 If another device already holds a name, the library would rename this one
 (`shop-2.local`). Traefik routes by the exact `Host`, so mypaas treats a rename
@@ -906,7 +912,9 @@ Each entry: what was decided, and why.
   address, whose ISP-assigned prefix changes, so `router.api_allow` cannot
   cover it and admin access depended on which record the client chose (first
   install, 2026-11-13). Cost: a LAN without a unique local prefix reaches the
-  server over IPv4 only.
+  server over IPv4 or link-local only. The link-local records stay, and LAN
+  setups list `fe80::/10` in `router.api_allow` (2026-11-14), since clients
+  that pick them arrive from a link-local address.
 - **Both switches, and off means off.** The Cargo feature removes the code, and
   `lan.enabled` removes the behaviour; a build without the feature refuses an
   enabled config rather than ignoring it.

@@ -376,7 +376,8 @@ chown = true                    # hand empty named volumes to the image's user
 socket_proxy = true             # Traefik gets a read-only Docker socket
 read_timeout = "300s"           # longest request on :443, uploads included
 strict_sni = true               # refuse TLS for names without a certificate
-api_allow = []                  # e.g. ["203.0.113.0/24"]: only these reach the API
+api_allow = []                  # e.g. ["203.0.113.0/24"]: only these reach the API;
+                                # in LAN mode add "fe80::/10" (see LAN mode)
 
 [stats]
 enabled = true                  # Traefik writes an access log for `mypaas stats`
@@ -388,6 +389,11 @@ interfaces = []                 # empty: every up, non-loopback, non-Docker inte
 allow = ["*.local"]             # names services may claim
 plain_admin = false             # admin API over plain HTTP; see LAN mode
 ```
+
+Traefik answers clients outside `api_allow` with `403 Forbidden` before the
+daemon sees the request, and the client reports that as `denied`, like a bad
+key. If `mypaas doctor` passes but a later command is denied now and then,
+check that `api_allow` covers every address the client may come from.
 
 The server refuses to start if a `volumes.allow` entry overlaps `/`,
 `~/.ssh`, `~/_mypaas` or `/var/run`.
@@ -505,8 +511,13 @@ the user that ran `init`, normally `/root/_mypaas/config.toml`):
 
 ```toml
 [router]
-api_allow = ["192.168.1.0/24", "fd12:3456:789a::/64"]  # your LAN's ranges from step 1
+api_allow = ["192.168.1.0/24", "fd12:3456:789a::/64", "fe80::/10"]  # your LAN's ranges from step 1
 ```
+
+Keep `fe80::/10`: mDNS also announces the server's link-local address, and a
+client that picks it connects from its own link-local address. Without it,
+deploys fail now and then with `denied`. Link-local addresses do not cross a
+router, so this admits only devices on the same network segment.
 
 Then write the files again and start everything:
 
@@ -540,7 +551,9 @@ mypaas -r lan push examples/lan-app
 mypaas -r lan ls                # shows lan-app.local as announced
 ```
 
-Open `http://lan-app.local` from any device on the network. Secrets need the
+Open `http://lan-app.local` from any device on the network.
+[examples/lan-dashboard](examples/lan-dashboard) is a start page at
+`http://dashboard.local` that lists links to your other LAN services. Secrets need the
 extra flag, because they cross the LAN unencrypted:
 
 ```sh
@@ -635,7 +648,7 @@ Then restrict the admin API to your network. In `config.toml`:
 
 ```toml
 [router]
-api_allow = ["192.168.1.0/24", "fd12:3456:789a::/64"]  # your LAN's IPv4 and unique local IPv6 ranges
+api_allow = ["192.168.1.0/24", "fd12:3456:789a::/64", "fe80::/10"]  # your LAN's IPv4, unique local IPv6 and link-local ranges
 ```
 
 and run `mypaas server restart all`. Traefik answers everyone else with 403.
